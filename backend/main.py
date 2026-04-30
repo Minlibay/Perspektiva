@@ -777,7 +777,23 @@ def _parse_json_response(text: str) -> dict:
                 end = i
                 break
     if end < 0:
-        raise ValueError(f"Не удалось найти закрывающую скобку JSON: {text[:300]}")
+        # Ответ обрезан max_tokens — попробуем восстановить.
+        repaired = cleaned[start:]
+        if in_string:
+            repaired += '"'
+        repaired = re.sub(r',\s*$', '', repaired.rstrip())
+        repaired += '}' * max(depth, 1)
+        try:
+            return json.loads(repaired)
+        except Exception:
+            try:
+                fixed = re.sub(r'\bTrue\b', 'true', repaired)
+                fixed = re.sub(r'\bFalse\b', 'false', fixed)
+                fixed = re.sub(r'\bNone\b', 'null', fixed)
+                return json.loads(fixed)
+            except Exception:
+                pass
+        raise ValueError(f"Ответ модели обрезан, восстановить не удалось: {text[:300]}")
 
     blob = cleaned[start:end + 1]
 
@@ -1069,7 +1085,7 @@ ok и nok — взаимоисключающие: ровно один true, др
 
 Проведи проверку: сам сравни данные между файлами. OK — если данные есть и согласуются. NOK — только если данных нет или есть явное противоречие."""
 
-    response = _gigachat_call(api_key, system_prompt, user_prompt, model=model, max_tokens=2500)
+    response = _gigachat_call(api_key, system_prompt, user_prompt, model=model, max_tokens=3500)
     result = _parse_json_response(response)
 
     # Нормализация: ровно один из ok/nok должен быть true.
@@ -1150,7 +1166,7 @@ def adversarial_recheck(api_key: str, item: dict, ii_references: dict,
 Найди причины поменять на NOK. Если не нашёл — подтверди OK."""
 
     try:
-        response = _gigachat_call(api_key, system_prompt, user_prompt, model=model, max_tokens=2500)
+        response = _gigachat_call(api_key, system_prompt, user_prompt, model=model, max_tokens=3500)
         result = _parse_json_response(response)
 
         ok = bool(result.get("ok", False))
@@ -1181,12 +1197,15 @@ ITEM_RULES = {
         "file_keywords": ["план"],
         "extra_instructions": (
             "Этот пункт проверяет САМ документ \"ПЛАН аудита\" (включён в evidence как файл \"ПЛАН АУДИТА (проверяемый документ)\").\n\n"
-            "ПРОВЕРЬ:\n"
-            "1. В шапке Плана АУДИТА должна быть дата утверждения/согласования (слова \"утверждаю\", \"утверждено\", \"согласовано\" и дата рядом).\n"
-            "2. В Плане указаны сроки проведения аудита (даты начала и окончания).\n"
-            "3. ПРАВИЛО: дата утверждения НЕ ПОЗДНЕЕ чем за 5 рабочих дней до даты начала аудита (СБ и ВС не считаются).\n\n"
-            "NOK если: нет даты утверждения; нет сроков; интервал < 5 рабочих дней.\n"
-            "В reason укажи обе даты и расчёт рабочих дней."
+            "АЛГОРИТМ (выполни ВСЕ шаги по порядку):\n"
+            "ШАГ 1. Найди в шапке/колонтитуле Плана дату утверждения/согласования (рядом со словами \"утверждаю\", \"утверждено\", \"согласовано\", \"УТВ\", \"СОГЛ\"). Запиши её как D_утв.\n"
+            "ШАГ 2. Найди дату НАЧАЛА аудита (поле \"Сроки проведения аудита\"). Если указан диапазон дат — бери самую раннюю. Запиши как D_начало.\n"
+            "ШАГ 3. Если D_утв или D_начало отсутствуют → NOK.\n"
+            "ШАГ 4. Если D_утв >= D_начало (утверждение в день начала или ПОСЛЕ) → NOK. Утверждать после начала аудита недопустимо.\n"
+            "ШАГ 5. Посчитай число РАБОЧИХ дней (Пн–Пт, без Сб/Вс) строго МЕЖДУ D_утв и D_начало (не включая обе границы).\n"
+            "ШАГ 6. Если рабочих дней < 5 → NOK. Если рабочих дней >= 5 → OK.\n\n"
+            "В reason ОБЯЗАТЕЛЬНО приведи обе даты и явный расчёт: \"D_утв = ДД.ММ.ГГГГ, D_начало = ДД.ММ.ГГГГ, между ними N рабочих дней → OK/NOK\".\n"
+            "Если расчёт не приведён — это автоматически считается ошибкой проверки."
         ),
     },
     1: {
