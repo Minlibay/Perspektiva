@@ -708,20 +708,27 @@ def _gigachat_call(api_key: str, system_prompt: str, user_prompt: str,
 
 
 def _parse_json_response(text: str) -> dict:
-    """Извлечь и распарсить JSON из ответа GigaChat (с поддержкой markdown-блоков)."""
-    import re
+    """Извлечь и распарсить JSON из ответа GigaChat.
+
+    Толерантно к частым отклонениям моделей:
+    - markdown-обёртка ```json ... ```
+    - Python-словарь с одинарными кавычками
+    - True/False/None вместо true/false/null
+    - висячие запятые перед закрывающей скобкой
+    """
+    import re, ast
     cleaned = text.strip()
-    # Снимаем markdown-обёртку ```json ... ```
     cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
     cleaned = re.sub(r'\s*```$', '', cleaned)
 
     start = cleaned.find('{')
     if start < 0:
-        raise ValueError(f"JSON не найден: {cleaned[:200]}")
+        raise ValueError(f"JSON не найден: {text[:200]}")
 
     depth = 0
     in_string = False
     escape = False
+    end = -1
     for i in range(start, len(cleaned)):
         ch = cleaned[i]
         if escape:
@@ -740,8 +747,33 @@ def _parse_json_response(text: str) -> dict:
         elif ch == '}':
             depth -= 1
             if depth == 0:
-                return json.loads(cleaned[start:i+1])
-    raise ValueError(f"Не удалось найти закрывающую скобку JSON: {cleaned[:300]}")
+                end = i
+                break
+    if end < 0:
+        raise ValueError(f"Не удалось найти закрывающую скобку JSON: {text[:300]}")
+
+    blob = cleaned[start:end + 1]
+
+    try:
+        return json.loads(blob)
+    except Exception:
+        pass
+
+    try:
+        result = ast.literal_eval(blob)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+
+    fixed = re.sub(r'\bTrue\b', 'true', blob)
+    fixed = re.sub(r'\bFalse\b', 'false', fixed)
+    fixed = re.sub(r'\bNone\b', 'null', fixed)
+    fixed = re.sub(r',(\s*[}\]])', r'\1', fixed)
+    try:
+        return json.loads(fixed)
+    except Exception as e:
+        raise ValueError(f"JSON не парсится ({e}). Ответ модели: {blob[:400]}") from e
 
 
 def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") -> dict:
