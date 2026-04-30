@@ -1,0 +1,24 @@
+services:
+  backend:
+    build: ./backend
+    container_name: audit-backend
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - ENABLE_LOCAL_UPLOAD=0
+    volumes:
+      - ./backend/gigachat_settings.json:/app/gigachat_settings.json
+    expose:
+      - "8000"
+    mem_limit: 4g
+    mem_reservation: 1g
+
+  frontend:
+    build: ./frontend
+    container_name: audit-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    mem_limit: 256m
