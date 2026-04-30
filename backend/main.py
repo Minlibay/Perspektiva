@@ -219,7 +219,7 @@ def extract_text_from_docx(file_path: str) -> str:
     return body
 
 
-_OCR_DPI = int(os.environ.get("OCR_DPI", "150"))
+_OCR_DPI = int(os.environ.get("OCR_DPI", "200"))
 _OCR_LANG = os.environ.get("OCR_LANG", "rus+eng")
 
 
