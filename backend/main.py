@@ -193,18 +193,45 @@ def _scan_text_for_checkbox_symbols(text: str) -> str:
     return "=== СИМВОЛЫ-ОТМЕТКИ В ТЕКСТЕ ===\n" + "\n".join(findings[:60])
 
 
-def extract_text_from_docx(file_path: str) -> str:
-    """Извлечение текста из .docx файла + распознанные галочки/крестики."""
-    doc = Document(file_path)
-    texts = []
-    for para in doc.paragraphs:
+def _collect_docx_part_text(part) -> list:
+    """Собирает параграфы и таблицы из произвольной части docx (body/header/footer)."""
+    out = []
+    for para in getattr(part, "paragraphs", []):
         if para.text.strip():
-            texts.append(para.text)
-    for table in doc.tables:
+            out.append(para.text)
+    for table in getattr(part, "tables", []):
         for row in table.rows:
             row_texts = [cell.text.strip() for cell in row.cells]
             if any(row_texts):
-                texts.append(" | ".join(row_texts))
+                out.append(" | ".join(row_texts))
+    return out
+
+
+def extract_text_from_docx(file_path: str) -> str:
+    """Извлечение текста из .docx файла + колонтитулы + распознанные галочки/крестики."""
+    doc = Document(file_path)
+    texts = []
+
+    for section in doc.sections:
+        for hdr_attr in ("header", "first_page_header", "even_page_header"):
+            hdr = getattr(section, hdr_attr, None)
+            if hdr is not None:
+                hdr_texts = _collect_docx_part_text(hdr)
+                if hdr_texts:
+                    texts.append(f"=== КОЛОНТИТУЛ ({hdr_attr}) ===")
+                    texts.extend(hdr_texts)
+
+    texts.extend(_collect_docx_part_text(doc))
+
+    for section in doc.sections:
+        for ftr_attr in ("footer", "first_page_footer", "even_page_footer"):
+            ftr = getattr(section, ftr_attr, None)
+            if ftr is not None:
+                ftr_texts = _collect_docx_part_text(ftr)
+                if ftr_texts:
+                    texts.append(f"=== НИЖНИЙ КОЛОНТИТУЛ ({ftr_attr}) ===")
+                    texts.extend(ftr_texts)
+
     body = "\n".join(texts)
 
     extras = []
@@ -1923,6 +1950,32 @@ async def download_file(filename: str):
         filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
+
+
+@app.get("/api/debug/extract")
+async def debug_extract_text(filename: str, session_id: str):
+    """Диагностика: возвращает текст, который бэк реально извлекает из файла
+    (тот же текст, что уйдёт в модель). Помогает понять, упирается ли проблема
+    в извлечение/OCR или в саму модель."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="Некорректный session_id")
+    sdir = UPLOAD_DIR / session_id
+    fpath = sdir / filename
+    if not fpath.exists() or not fpath.is_file():
+        raise HTTPException(status_code=404, detail="Файл не найден в сессии")
+    suffix = fpath.suffix.lower()
+    try:
+        if suffix in ('.docx', '.docm'):
+            text = extract_text_from_docx(str(fpath))
+        elif suffix == '.pdf':
+            text = extract_text_from_pdf(str(fpath))
+        elif suffix == '.xlsx':
+            text = extract_text_from_xlsx(str(fpath))
+        else:
+            raise HTTPException(status_code=400, detail=f"Неподдерживаемый формат: {suffix}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка извлечения: {e}")
+    return {"filename": filename, "length": len(text), "text": text}
 
 
 @app.get("/api/files")
