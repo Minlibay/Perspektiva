@@ -219,32 +219,20 @@ def extract_text_from_docx(file_path: str) -> str:
     return body
 
 
-_ocr_reader = None
-_ocr_init_lock = __import__('threading').Lock()
+_OCR_DPI = int(os.environ.get("OCR_DPI", "150"))
+_OCR_LANG = os.environ.get("OCR_LANG", "rus+eng")
 
 
-def _get_ocr_reader():
-    """Lazy-init EasyOCR (тяжёлая инициализация, делаем один раз). Потоко-безопасно."""
-    global _ocr_reader
-    if _ocr_reader is not None:
-        return _ocr_reader
-    with _ocr_init_lock:
-        if _ocr_reader is not None:
-            return _ocr_reader
-        import easyocr
-        prev_detail = processing_status.get("detail", "")
-        processing_status["detail"] = "Инициализация OCR-движка (rus+eng)... первый запуск ~30-60 с"
-        print("[ocr] Инициализация EasyOCR (rus+eng)... первый запуск качает модели ~200MB")
-        _ocr_reader = easyocr.Reader(['ru', 'en'], gpu=False, verbose=False)
-        print("[ocr] EasyOCR готов")
-        processing_status["detail"] = prev_detail
-    return _ocr_reader
-
-
-def _ocr_pdf_pages(file_path: str, dpi: int = 200) -> str:
-    """OCR всех страниц PDF через PyMuPDF (рендер) + EasyOCR (распознавание)."""
+def _ocr_pdf_pages(file_path: str, dpi: int = None) -> str:
+    """OCR всех страниц PDF через PyMuPDF (рендер) + Tesseract (распознавание)."""
     import fitz
-    reader = _get_ocr_reader()
+    import pytesseract
+    from PIL import Image
+    import io
+
+    if dpi is None:
+        dpi = _OCR_DPI
+
     pages_text = []
     try:
         doc = fitz.open(file_path)
@@ -258,12 +246,9 @@ def _ocr_pdf_pages(file_path: str, dpi: int = 200) -> str:
         for page_idx, page in enumerate(doc):
             try:
                 processing_status["detail"] = f"OCR {fname}: стр {page_idx + 1}/{page_count}"
-                # Рендерим страницу в PNG-байты
                 pix = page.get_pixmap(dpi=dpi, alpha=False)
-                img_bytes = pix.tobytes("png")
-                # EasyOCR принимает байты
-                results = reader.readtext(img_bytes, detail=0, paragraph=True)
-                page_text = "\n".join(results) if results else ""
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                page_text = pytesseract.image_to_string(img, lang=_OCR_LANG)
                 if page_text.strip():
                     pages_text.append(f"--- Страница {page_idx + 1} (OCR) ---\n{page_text}")
                 print(f"[ocr] {fname} стр.{page_idx+1}/{page_count}: {len(page_text)} симв.")
