@@ -993,18 +993,20 @@ def verify_item_strict(api_key: str, item: dict, ii_references: dict,
 
 ok и nok — взаимоисключающие: ровно один true, другой false."""
 
+    extra_block = ("\n\nДОПОЛНИТЕЛЬНЫЕ ПРАВИЛА ДЛЯ ЭТОГО ПУНКТА:\n" + extra_instructions) if extra_instructions else ""
+    markers_str = ", ".join(ii_markers) if ii_markers else "нет"
     user_prompt = f"""ПУНКТ ДЛЯ ПРОВЕРКИ:
 ОБЛАСТЬ: {item['area']}
 ТРЕБОВАНИЯ (КОММЕНТАРИИ В ШАБЛОНЕ): {item['comments']}
 ПОДСКАЗКА (ПРОБЛЕМНЫЕ ЗОНЫ): {item['problems_hint']}
-МАРКЕРЫ ИИ В ПУНКТЕ: {', '.join(ii_markers) if ii_markers else 'нет'}
+МАРКЕРЫ ИИ В ПУНКТЕ: {markers_str}
 
 СПРАВОЧНИК МАРКЕРОВ ИИ:
 {ii_context if ii_context else '(нет маркеров)'}
 
 ДОКУМЕНТЫ-ИСТОЧНИКИ ДЛЯ ПРОВЕРКИ:
 {evidence if evidence else '(файлы не переданы)'}
-{('\n\nДОПОЛНИТЕЛЬНЫЕ ПРАВИЛА ДЛЯ ЭТОГО ПУНКТА:\n' + extra_instructions) if extra_instructions else ''}
+{extra_block}
 
 Проведи СТРОГУЮ проверку. Помни: по умолчанию NOK. OK только при явном доказательстве."""
 
