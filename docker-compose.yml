@@ -10,7 +10,8 @@ services:
       - ./backend/gigachat_settings.json:/app/gigachat_settings.json
     expose:
       - "8000"
-    mem_limit: 4g
+    mem_limit: 5g
+    memswap_limit: 9g
     mem_reservation: 1g
 
   frontend:
