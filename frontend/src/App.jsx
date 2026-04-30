@@ -28,6 +28,7 @@ function App() {
   const [diagnose, setDiagnose] = useState(null)
   const [files, setFiles] = useState({ plan: null, planDoc: null, sources: [] })
   const [uploadedFiles, setUploadedFiles] = useState({ plan: null, planDoc: null, sources: [] })
+  const [uploadProgress, setUploadProgress] = useState({ plan: null, planDoc: null, sources: null })
   const [processing, setProcessing] = useState(false)
   const [progress, setProgress] = useState(null)
   const [result, setResult] = useState(null)
@@ -171,26 +172,42 @@ function App() {
     }
   }
 
+  const doUpload = async (key, formData, errMsg) => {
+    setError(null)
+    setUploadProgress(prev => ({ ...prev, [key]: 0 }))
+    try {
+      const res = await axios.post(`${API_BASE}/api/upload`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        onUploadProgress: (e) => {
+          if (e.total) {
+            setUploadProgress(prev => ({ ...prev, [key]: Math.round((e.loaded / e.total) * 100) }))
+          }
+        }
+      })
+      return res
+    } catch (e) {
+      setError(errMsg)
+      throw e
+    } finally {
+      setUploadProgress(prev => ({ ...prev, [key]: null }))
+    }
+  }
+
   const uploadPlanDoc = async () => {
     if (!files.planDoc) {
       setError('Выберите файл "План"')
       return
     }
-    setError(null)
     const formData = new FormData()
     formData.append('files', files.planDoc)
     formData.append('file_type', 'plan_doc')
     if (sessionId) formData.append('session_id', sessionId)
     try {
-      const res = await axios.post(`${API_BASE}/api/upload`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
-      })
+      const res = await doUpload('planDoc', formData, 'Ошибка загрузки файла "План"')
       if (res.data.session_id) setSessionId(res.data.session_id)
       setUploadedFiles(prev => ({ ...prev, planDoc: res.data.uploaded_files[0] }))
       setFiles(prev => ({ ...prev, planDoc: null }))
-    } catch (e) {
-      setError('Ошибка загрузки файла "План"')
-    }
+    } catch (e) {}
   }
 
   const uploadPlan = async () => {
@@ -198,23 +215,16 @@ function App() {
       setError('Выберите файл Плана АУДИТА')
       return
     }
-
-    setError(null)
     const formData = new FormData()
     formData.append('files', files.plan)
     formData.append('file_type', 'plan')
     if (sessionId) formData.append('session_id', sessionId)
-
     try {
-      const res = await axios.post(`${API_BASE}/api/upload`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
-      })
+      const res = await doUpload('plan', formData, 'Ошибка загрузки плана')
       if (res.data.session_id) setSessionId(res.data.session_id)
       setUploadedFiles(prev => ({ ...prev, plan: res.data.uploaded_files[0] }))
       setFiles(prev => ({ ...prev, plan: null }))
-    } catch (e) {
-      setError('Ошибка загрузки плана')
-    }
+    } catch (e) {}
   }
 
   const uploadSources = async () => {
@@ -222,26 +232,19 @@ function App() {
       setError('Выберите файлы источников')
       return
     }
-
-    setError(null)
     const formData = new FormData()
     files.sources.forEach(file => formData.append('files', file))
     formData.append('file_type', 'source')
     if (sessionId) formData.append('session_id', sessionId)
-
     try {
-      const res = await axios.post(`${API_BASE}/api/upload`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
-      })
+      const res = await doUpload('sources', formData, 'Ошибка загрузки источников')
       if (res.data.session_id) setSessionId(res.data.session_id)
       setUploadedFiles(prev => ({
         ...prev,
         sources: [...prev.sources, ...res.data.uploaded_files]
       }))
       setFiles(prev => ({ ...prev, sources: [] }))
-    } catch (e) {
-      setError('Ошибка загрузки источников')
-    }
+    } catch (e) {}
   }
 
   const uploadFromPath = async (type) => {
@@ -482,18 +485,22 @@ function App() {
                   variant="primary"
                   size="sm"
                   onClick={uploadPlan}
-                  disabled={!files.plan}
+                  disabled={!files.plan || uploadProgress.plan !== null}
                 >
-                  Загрузить чек-лист
+                  {uploadProgress.plan !== null ? 'Загрузка...' : 'Загрузить чек-лист'}
                 </Button>
                 <Button
                   variant="outline-primary"
                   size="sm"
                   onClick={() => uploadFromPath('plan')}
+                  disabled={uploadProgress.plan !== null}
                 >
                   Из папки
                 </Button>
               </div>
+              {uploadProgress.plan !== null && (
+                <ProgressBar now={uploadProgress.plan} label={`${uploadProgress.plan}%`} animated className="mt-2" />
+              )}
               {uploadedFiles.plan && (
                 <div className="mt-3">
                   <Badge bg="primary" className="me-2 mb-2 d-inline-flex align-items-center">
@@ -524,11 +531,14 @@ function App() {
                   variant="info"
                   size="sm"
                   onClick={uploadPlanDoc}
-                  disabled={!files.planDoc}
+                  disabled={!files.planDoc || uploadProgress.planDoc !== null}
                 >
-                  Загрузить План
+                  {uploadProgress.planDoc !== null ? 'Загрузка...' : 'Загрузить План'}
                 </Button>
               </div>
+              {uploadProgress.planDoc !== null && (
+                <ProgressBar now={uploadProgress.planDoc} label={`${uploadProgress.planDoc}%`} animated variant="info" className="mt-2" />
+              )}
               {uploadedFiles.planDoc && (
                 <div className="mt-3">
                   <Badge bg="info" className="me-2 mb-2 d-inline-flex align-items-center">
@@ -556,22 +566,26 @@ function App() {
                 className="mb-2"
               />
               <div className="d-grid gap-2">
-                <Button 
-                  variant="success" 
+                <Button
+                  variant="success"
                   size="sm"
                   onClick={uploadSources}
-                  disabled={files.sources.length === 0}
+                  disabled={files.sources.length === 0 || uploadProgress.sources !== null}
                 >
-                  Загрузить ({files.sources.length} файлов)
+                  {uploadProgress.sources !== null ? 'Загрузка...' : `Загрузить (${files.sources.length} файлов)`}
                 </Button>
-                <Button 
-                  variant="outline-success" 
+                <Button
+                  variant="outline-success"
                   size="sm"
+                  disabled={uploadProgress.sources !== null}
                   onClick={() => uploadFromPath('sources')}
                 >
                   Из папки (Пакет 2, 3...)
                 </Button>
               </div>
+              {uploadProgress.sources !== null && (
+                <ProgressBar now={uploadProgress.sources} label={`${uploadProgress.sources}%`} animated variant="success" className="mt-2" />
+              )}
               {uploadedFiles.sources.length > 0 && (
                 <div className="mt-3">
                   {uploadedFiles.sources.map((f, idx) => (
