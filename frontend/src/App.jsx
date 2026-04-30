@@ -323,7 +323,7 @@ function App() {
 
       const res = await axios.post(`${API_BASE}/api/process`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 30 * 60 * 1000, // 30 мин — per-item пайплайн может идти долго
+        timeout: 60 * 60 * 1000, // 1 час — per-item пайплайн может идти долго
       })
 
       setResult(res.data)
