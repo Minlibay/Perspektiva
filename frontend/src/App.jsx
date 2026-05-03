@@ -580,7 +580,7 @@ function App() {
                   disabled={uploadProgress.sources !== null}
                   onClick={() => uploadFromPath('sources')}
                 >
-                  Из папки (Пакет 2, 3...)
+                  Загрузить папку
                 </Button>
               </div>
               {uploadProgress.sources !== null && (
