@@ -473,7 +473,7 @@ function App() {
               📄 1. План АУДИТА (чек-лист)
             </Card.Header>
             <Card.Body className="d-flex flex-column">
-              <Form.Label className="text-muted small">"ИИ -ЧК -План АУДИТА.docx" — шаблон с пунктами проверки</Form.Label>
+              <Form.Label className="text-muted small">Шаблон с пунктами проверки</Form.Label>
               <Form.Control
                 type="file"
                 accept=".docx,.doc,.docm,.pdf,.xlsx"
@@ -516,10 +516,10 @@ function App() {
         <Col md={4}>
           <Card className="mb-4 h-100">
             <Card.Header className="bg-info text-white">
-              📋 2. План (документ аудита)
+              📋 2. Документы по аудиту
             </Card.Header>
             <Card.Body className="d-flex flex-column">
-              <Form.Label className="text-muted small">Файл "План" — даты, оргструктура, расписание, состав ЭГ</Form.Label>
+              <Form.Label className="text-muted small">Даты аудита, описание, состав ЭГ</Form.Label>
               <Form.Control
                 type="file"
                 accept=".docx,.doc,.docm,.pdf,.xlsx"
@@ -554,10 +554,10 @@ function App() {
         <Col md={4}>
           <Card className="mb-4 h-100">
             <Card.Header className="bg-success text-white">
-              📚 3. Источники данных
+              📚 3. Источники данных о компании
             </Card.Header>
             <Card.Body className="d-flex flex-column">
-              <Form.Label className="text-muted small">Документы, откуда GigaChat извлечёт данные (Пакет 2, Пакет 3...)</Form.Label>
+              <Form.Label className="text-muted small">Все документы с исходными данными компании, по которой проводится аудит</Form.Label>
               <Form.Control 
                 type="file" 
                 multiple 
