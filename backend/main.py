@@ -1301,16 +1301,43 @@ ok и nok — взаимоисключающие: ровно один true, др
     area_text = (item.get("area") or "") + " " + (item.get("comments") or "")
     if ("утверждения" in area_text.lower() or "согласования" in area_text.lower()) and ok:
         reason_text = result.get("reason") or ""
-        date_re = re.compile(r"\b\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}\b")
-        dates_found = date_re.findall(reason_text)
-        has_diff_word = any(w in reason_text.lower() for w in ("разниц", "рабочих дн", "рабочих д.", "раб.дн"))
-        if len(dates_found) < 2 or not has_diff_word:
-            ok, nok = False, True
-            result["reason"] = (
-                "[авто-NOK: для пункта 1 в reason обязаны быть обе даты (D_утв, D_начало) "
-                "и явная разница в рабочих днях. Модель не привела расчёт.] "
-                + reason_text
-            )
+        reason_lower = reason_text.lower()
+
+        # 1) Жёсткая проверка по самопризнанному числу: если модель сама написала
+        #    "N рабочих дней" с N > 5 — форс-NOK независимо от того, как она это
+        #    интерпретирует ("но требование выполнено" — нет, требование нарушено).
+        num_match = re.search(
+            r"(\d{1,3})\s*(?:рабочих)?\s*раб?(?:очих)?\.?\s*д(?:н(?:[еия][йвм]?)?|\.)",
+            reason_lower
+        )
+        if not num_match:
+            # Запасной паттерн: "разница ... N ..."
+            num_match = re.search(r"разниц\w*[^0-9]{1,40}(\d{1,3})", reason_lower)
+        if num_match:
+            try:
+                n_days = int(num_match.group(1))
+                if n_days > 5:
+                    ok, nok = False, True
+                    result["reason"] = (
+                        f"[авто-NOK: модель сама указала разницу {n_days} рабочих дней > 5 "
+                        f"(окно допуска ≤5), но ошибочно поставила OK] "
+                        + reason_text
+                    )
+            except ValueError:
+                pass
+
+        # 2) Если расчёт вообще не приведён (нет дат и/или слова "разница") — также NOK.
+        if ok:
+            date_re = re.compile(r"\b\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}\b")
+            dates_found = date_re.findall(reason_text)
+            has_diff_word = any(w in reason_lower for w in ("разниц", "рабочих дн", "рабочих д.", "раб.дн"))
+            if len(dates_found) < 2 or not has_diff_word:
+                ok, nok = False, True
+                result["reason"] = (
+                    "[авто-NOK: для пункта 1 в reason обязаны быть обе даты (D_утв, D_начало) "
+                    "и явная разница в рабочих днях. Модель не привела расчёт.] "
+                    + reason_text
+                )
 
     result["ok"] = ok
     result["nok"] = nok
