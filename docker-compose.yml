@@ -8,6 +8,8 @@ services:
       - ENABLE_LOCAL_UPLOAD=0
     volumes:
       - ./backend/gigachat_settings.json:/app/gigachat_settings.json
+      - ./backend/uploads:/app/uploads
+      - ./backend/outputs:/app/outputs
     expose:
       - "8000"
     mem_reservation: 1g
@@ -19,5 +21,5 @@ services:
     depends_on:
       - backend
     ports:
-      - "80:80"
+      - "8080:80"
     mem_limit: 256m

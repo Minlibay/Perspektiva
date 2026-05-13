@@ -1811,10 +1811,15 @@ async def root():
     return {"message": "Audit Plan Filler API", "version": "1.0.0"}
 
 
-@app.get("/api/validate/{filename}")
+@app.get("/api/validate/{filename:path}")
 async def validate_result(filename: str):
-    """Проверка корректности заполненного документа"""
-    file_path = OUTPUT_DIR / filename
+    """Проверка корректности заполненного документа.
+    filename может быть '<session_id>/<file>' или просто '<file>'."""
+    file_path = (OUTPUT_DIR / filename).resolve()
+    try:
+        file_path.relative_to(OUTPUT_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Некорректный путь")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Файл не найден")
     
@@ -2241,7 +2246,7 @@ async def process_documents(
         "message": "Валидация результата...",
         "detail": "",
     })
-    validation = await validate_result("Заполненный_План_АУДИТА.docx")
+    validation = await validate_result(output_ref)
     
     # Если есть критические проблемы — пробуем исправить
     if not validation.get("valid"):
