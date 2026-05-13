@@ -1088,7 +1088,8 @@ def verify_item_strict(api_key: str, item: dict, ii_references: dict,
                         evidence: str, model: str = "GigaChat",
                         extra_instructions: str = "",
                         comparison: bool = False,
-                        compare_fields: str = "") -> dict:
+                        compare_fields: str = "",
+                        expected_file_keywords: Optional[list] = None) -> dict:
     """
     Строгая проверка пункта чек-листа с NOK-first логикой.
     Возвращает: {ok, nok, reason, ii_data_found, evidence_quote, source_file}.
@@ -1233,6 +1234,10 @@ ok и nok — взаимоисключающие: ровно один true, др
         elif isinstance(extracted, list) and extracted:
             mismatches = []
             hallucinations = []
+            wrong_files = []
+            kw_norm = [k.lower() for k in (expected_file_keywords or []) if k]
+            # Слова, по которым понимаем что other_file — это «План аудита» (его не считаем нужным источником)
+            plan_markers = ("план", "plan")
             for row in extracted:
                 if not isinstance(row, dict):
                     continue
@@ -1252,6 +1257,24 @@ ok и nok — взаимоисключающие: ровно один true, др
                     b = (row.get("value_in_other") or "").strip()
                     other = row.get("other_file", "")
                     mismatches.append(f"{field}: '{a}' (План) vs '{b}' ({other})")
+                # 3) Проверка, что other_file — именно ожидаемый источник (а не подменённый
+                #    моделью «что есть на руках»).
+                if kw_norm:
+                    other_name = (row.get("other_file") or "").strip().lower()
+                    if not other_name or other_name in ("не найдено", "—", "-", "n/a", "нет"):
+                        # Источник не назван — это проблема только если value_in_other непустое
+                        if (row.get("value_in_other") or "").strip().lower() not in ("", "не найдено"):
+                            wrong_files.append(f"{row.get('field', 'поле')}: other_file пуст")
+                    else:
+                        # other_file должен содержать хотя бы одно ключевое слово ИЛИ быть Планом
+                        # (если поле сравнивается «План vs План» — норм). Но обычно нужен внешний.
+                        is_expected = any(k in other_name for k in kw_norm)
+                        is_plan = any(p in other_name for p in plan_markers) and "плана" not in other_name
+                        if not is_expected and not is_plan:
+                            wrong_files.append(
+                                f"{row.get('field', 'поле')}: сверка с '{other_name[:60]}' "
+                                f"вместо ожидаемого источника по ключам {kw_norm[:3]}"
+                            )
 
             if hallucinations:
                 ok, nok = False, True
@@ -1260,11 +1283,34 @@ ok и nok — взаимоисключающие: ровно один true, др
                     + "; ".join(hallucinations[:5])
                     + (" | " + result.get("reason", "") if result.get("reason") else "")
                 )
+            elif wrong_files:
+                ok, nok = False, True
+                result["reason"] = (
+                    "[авто-NOK: нужный файл-источник не загружен — модель сверила с тем что нашла] "
+                    + "; ".join(wrong_files[:5])
+                    + (" | " + result.get("reason", "") if result.get("reason") else "")
+                )
             elif mismatches and ok:
                 ok, nok = False, True
                 result["reason"] = ("[авто-NOK: расхождения по сверке] "
                                     + "; ".join(mismatches[:5])
                                     + (" | " + result.get("reason", "") if result.get("reason") else ""))
+
+    # Пост-проверка для пункта 1 (даты утверждения/начала).
+    # Распознаём по специфичной фразе из требования.
+    area_text = (item.get("area") or "") + " " + (item.get("comments") or "")
+    if ("утверждения" in area_text.lower() or "согласования" in area_text.lower()) and ok:
+        reason_text = result.get("reason") or ""
+        date_re = re.compile(r"\b\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}\b")
+        dates_found = date_re.findall(reason_text)
+        has_diff_word = any(w in reason_text.lower() for w in ("разниц", "рабочих дн", "рабочих д.", "раб.дн"))
+        if len(dates_found) < 2 or not has_diff_word:
+            ok, nok = False, True
+            result["reason"] = (
+                "[авто-NOK: для пункта 1 в reason обязаны быть обе даты (D_утв, D_начало) "
+                "и явная разница в рабочих днях. Модель не привела расчёт.] "
+                + reason_text
+            )
 
     result["ok"] = ok
     result["nok"] = nok
@@ -1644,10 +1690,12 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
             extra_rules = ""
             comparison_flag = False
             compare_fields = ""
+            expected_file_keywords = None
             if rule:
                 extra_rules = rule.get("extra_instructions", "")
                 comparison_flag = bool(rule.get("comparison", False))
                 compare_fields = rule.get("compare_fields", "")
+                expected_file_keywords = rule.get("file_keywords") or None
                 # Для пунктов с правилами всегда добавляем текст самого Плана
                 if template_text:
                     template_block = f"=== ФАЙЛ: ПЛАН АУДИТА (проверяемый документ) ===\n{template_text[:30000]}"
@@ -1657,7 +1705,8 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
             verdict = verify_item_strict(api_key, item, ii_references, evidence, model=model,
                                           extra_instructions=extra_rules,
                                           comparison=comparison_flag,
-                                          compare_fields=compare_fields)
+                                          compare_fields=compare_fields,
+                                          expected_file_keywords=expected_file_keywords)
 
             if verdict.get("ok"):
                 processing_status["detail"] = "adversarial-перепроверка OK-вердикта..."
