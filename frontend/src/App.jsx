@@ -1,7 +1,75 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Fragment } from 'react'
 import { Container, Row, Col, Card, Button, Form, Alert, Spinner, Table, Badge, Collapse, ProgressBar } from 'react-bootstrap'
 import axios from 'axios'
 import './App.css'
+
+function SessionDetails({ data }) {
+  if (!data) return <div className="p-2 text-muted">Загрузка...</div>
+  const meta = data.meta || {}
+  const blocks = meta.blocks || {}
+  const renderBlock = (label, files, badgeBg) => (
+    <div className="mb-2">
+      <strong>{label}:</strong>{' '}
+      {files && files.length > 0 ? (
+        files.map((f, i) => <Badge bg={badgeBg} key={i} className="me-1 mb-1">{f}</Badge>)
+      ) : (
+        <span className="text-muted small">нет</span>
+      )}
+    </div>
+  )
+  return (
+    <div className="p-3">
+      <Row>
+        <Col md={6}>
+          {renderBlock('Чек-лист (блок 1)', blocks.checklist || (meta.template_file ? [meta.template_file] : []), 'primary')}
+          {renderBlock('План аудита (блок 2)', blocks.plan || (meta.plan_doc_file ? [meta.plan_doc_file] : []), 'info')}
+          {renderBlock('Источники (блок 3)', blocks.sources || meta.source_files || [], 'success')}
+        </Col>
+        <Col md={6}>
+          <div className="mb-2"><strong>Создана:</strong> <span className="small">{meta.created_at || '—'}</span></div>
+          <div className="mb-2"><strong>Завершена:</strong> <span className="small">{meta.finished_at || '—'}</span></div>
+          <div className="mb-2"><strong>Модель:</strong> <code className="small">{meta.model || '—'}</code></div>
+          <div className="mb-2">
+            <strong>Все файлы в сессии ({(data.files || []).length}):</strong>
+            <div className="small text-muted" style={{ maxHeight: 100, overflowY: 'auto' }}>
+              {(data.files || []).map(f => f.name).join(', ') || '—'}
+            </div>
+          </div>
+          {(data.output_files || []).length > 0 && (
+            <div className="mb-2">
+              <strong>Результат:</strong>{' '}
+              {data.output_files.map((f, i) => (
+                <a key={i} href={`${API_BASE}/api/download/${encodeURIComponent(f.ref)}`}
+                   className="me-2" target="_blank" rel="noreferrer">
+                  📥 {f.name}
+                </a>
+              ))}
+            </div>
+          )}
+        </Col>
+      </Row>
+      {meta.checklist && meta.checklist.length > 0 && (
+        <details className="mt-2">
+          <summary className="small text-muted" style={{ cursor: 'pointer' }}>
+            Показать вердикты по {meta.checklist.length} пунктам
+          </summary>
+          <Table size="sm" bordered className="mt-2 mb-0">
+            <thead><tr><th style={{ width: '4ch' }}>#</th><th style={{ width: '8ch' }}>Статус</th><th>Обоснование</th></tr></thead>
+            <tbody>
+              {meta.checklist.map((it, i) => (
+                <tr key={i}>
+                  <td>{i + 1}</td>
+                  <td>{it.ok ? <Badge bg="success">OK</Badge> : <Badge bg="danger">NOK</Badge>}</td>
+                  <td className="small">{it.reason || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </details>
+      )}
+    </div>
+  )
+}
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
@@ -38,6 +106,53 @@ function App() {
   const [activityLog, setActivityLog] = useState([])
   const [startTime, setStartTime] = useState(null)
   const [elapsed, setElapsed] = useState(0)
+  const [showAdmin, setShowAdmin] = useState(false)
+  const [adminSessions, setAdminSessions] = useState([])
+  const [adminLoading, setAdminLoading] = useState(false)
+  const [adminExpanded, setAdminExpanded] = useState({})
+
+  const loadAdminSessions = async () => {
+    setAdminLoading(true)
+    try {
+      const res = await axios.get(`${API_BASE}/api/admin/sessions?limit=100`)
+      setAdminSessions(res.data.sessions || [])
+    } catch (e) {
+      setError('Не удалось загрузить список сессий')
+    } finally {
+      setAdminLoading(false)
+    }
+  }
+
+  const toggleAdminDetails = async (sid) => {
+    if (adminExpanded[sid]?.loaded) {
+      setAdminExpanded(prev => ({ ...prev, [sid]: { ...prev[sid], open: !prev[sid].open } }))
+      return
+    }
+    try {
+      const res = await axios.get(`${API_BASE}/api/admin/sessions/${sid}`)
+      setAdminExpanded(prev => ({ ...prev, [sid]: { open: true, loaded: true, data: res.data } }))
+    } catch (e) {
+      setError('Не удалось загрузить детали сессии')
+    }
+  }
+
+  const downloadSessionZip = (sid) => {
+    window.open(`${API_BASE}/api/admin/sessions/${sid}/zip`, '_blank')
+  }
+
+  const deleteSession = async (sid) => {
+    if (!confirm(`Удалить сессию ${sid.slice(0, 8)}…? Файлы и результат будут стёрты.`)) return
+    try {
+      await axios.delete(`${API_BASE}/api/admin/sessions/${sid}`)
+      setAdminSessions(prev => prev.filter(s => s.session_id !== sid))
+    } catch (e) {
+      setError('Не удалось удалить сессию')
+    }
+  }
+
+  useEffect(() => {
+    if (showAdmin) loadAdminSessions()
+  }, [showAdmin])
 
   // Загрузка настроек при старте
   useEffect(() => {
@@ -201,6 +316,7 @@ function App() {
     const formData = new FormData()
     formData.append('files', files.planDoc)
     formData.append('file_type', 'plan_doc')
+    formData.append('block', 'plan')
     if (sessionId) formData.append('session_id', sessionId)
     try {
       const res = await doUpload('planDoc', formData, 'Ошибка загрузки файла "План"')
@@ -218,6 +334,7 @@ function App() {
     const formData = new FormData()
     formData.append('files', files.plan)
     formData.append('file_type', 'plan')
+    formData.append('block', 'checklist')
     if (sessionId) formData.append('session_id', sessionId)
     try {
       const res = await doUpload('plan', formData, 'Ошибка загрузки плана')
@@ -235,6 +352,7 @@ function App() {
     const formData = new FormData()
     files.sources.forEach(file => formData.append('files', file))
     formData.append('file_type', 'source')
+    formData.append('block', 'sources')
     if (sessionId) formData.append('session_id', sessionId)
     try {
       const res = await doUpload('sources', formData, 'Ошибка загрузки источников')
@@ -256,6 +374,7 @@ function App() {
       const formData = new FormData()
       formData.append('source_path', path)
       formData.append('file_type', type)
+      formData.append('block', type === 'plan' ? 'checklist' : 'sources')
       if (sessionId) formData.append('session_id', sessionId)
       const res = await axios.post(`${API_BASE}/api/upload-from-path`, formData)
       if (res.data.session_id) setSessionId(res.data.session_id)
@@ -356,13 +475,94 @@ function App() {
 
   return (
     <Container fluid className="py-4">
+      <div className="d-flex justify-content-end mb-2">
+        <Button
+          size="sm"
+          variant={showAdmin ? 'dark' : 'outline-dark'}
+          onClick={() => setShowAdmin(v => !v)}
+        >
+          {showAdmin ? '← К рабочему режиму' : '🔧 Админ'}
+        </Button>
+      </div>
+
       <h1 className="mb-4 text-center">
         <Badge bg="primary">План АУДИТА</Badge>
         <br />
         <span className="fs-5">Автоматическое заполнение с GigaChat</span>
       </h1>
 
-      <Row>
+      {showAdmin && (
+        <Card className="mb-4">
+          <Card.Header className="bg-dark text-white d-flex justify-content-between align-items-center">
+            <span>🗂 История запросов</span>
+            <Button size="sm" variant="outline-light" onClick={loadAdminSessions} disabled={adminLoading}>
+              {adminLoading ? 'Обновление...' : '↻ Обновить'}
+            </Button>
+          </Card.Header>
+          <Card.Body className="p-0">
+            {adminSessions.length === 0 ? (
+              <div className="p-3 text-muted">{adminLoading ? 'Загрузка...' : 'Сессий нет.'}</div>
+            ) : (
+              <Table hover responsive size="sm" className="mb-0">
+                <thead className="table-light">
+                  <tr>
+                    <th style={{ width: '14ch' }}>ID</th>
+                    <th>Время</th>
+                    <th>Заявитель</th>
+                    <th>Файлы</th>
+                    <th>Результат</th>
+                    <th>Модель</th>
+                    <th style={{ width: '20ch' }}>Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {adminSessions.map(s => (
+                    <Fragment key={s.session_id}>
+                      <tr>
+                        <td><code className="small">{s.session_id.slice(0, 8)}…</code></td>
+                        <td className="small">{s.finished_at || s.created_at || '—'}</td>
+                        <td className="small">{s.applicant || <span className="text-muted">—</span>}</td>
+                        <td><Badge bg="secondary">{s.files_count}</Badge></td>
+                        <td>
+                          {s.total_items != null ? (
+                            <>
+                              <Badge bg="success" className="me-1">OK {s.ok_count ?? 0}</Badge>
+                              <Badge bg="danger">NOK {s.nok_count ?? 0}</Badge>
+                            </>
+                          ) : (
+                            <span className="text-muted small">не обработано</span>
+                          )}
+                        </td>
+                        <td className="small">{s.model || '—'}</td>
+                        <td>
+                          <Button size="sm" variant="outline-primary" className="me-1" onClick={() => toggleAdminDetails(s.session_id)}>
+                            {adminExpanded[s.session_id]?.open ? 'Скрыть' : 'Детали'}
+                          </Button>
+                          <Button size="sm" variant="outline-success" className="me-1" onClick={() => downloadSessionZip(s.session_id)}>
+                            ZIP
+                          </Button>
+                          <Button size="sm" variant="outline-danger" onClick={() => deleteSession(s.session_id)}>
+                            ✕
+                          </Button>
+                        </td>
+                      </tr>
+                      {adminExpanded[s.session_id]?.open && (
+                        <tr>
+                          <td colSpan={7} className="bg-light">
+                            <SessionDetails data={adminExpanded[s.session_id]?.data} />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </Table>
+            )}
+          </Card.Body>
+        </Card>
+      )}
+
+      <Row style={{ display: showAdmin ? 'none' : undefined }}>
         {/* Настройки GigaChat */}
         <Col md={12} className="mb-4">
           <Card>
@@ -470,7 +670,7 @@ function App() {
         <Col md={4}>
           <Card className="mb-4 h-100">
             <Card.Header className="bg-primary text-white">
-              📄 1. План АУДИТА (чек-лист)
+              📄 1. Чек-лист аудитора
             </Card.Header>
             <Card.Body className="d-flex flex-column">
               <Form.Label className="text-muted small">Шаблон с пунктами проверки</Form.Label>
@@ -516,10 +716,12 @@ function App() {
         <Col md={4}>
           <Card className="mb-4 h-100">
             <Card.Header className="bg-info text-white">
-              📋 2. Документы по аудиту
+              📋 2. План аудита
             </Card.Header>
             <Card.Body className="d-flex flex-column">
-              <Form.Label className="text-muted small">Даты аудита, описание, состав ЭГ</Form.Label>
+              <Form.Label className="text-muted small">
+                Файл с Планом аудита, содержащий пункты «Цель и область аудита», «Основание», «Сроки», «Состав ЭГ» и т. д.
+              </Form.Label>
               <Form.Control
                 type="file"
                 accept=".docx,.doc,.docm,.pdf,.xlsx"
@@ -557,7 +759,17 @@ function App() {
               📚 3. Источники данных о компании
             </Card.Header>
             <Card.Body className="d-flex flex-column">
-              <Form.Label className="text-muted small">Все документы с исходными данными компании, по которой проводится аудит</Form.Label>
+              <Form.Label className="text-muted small">
+                Документы для сверки с Планом:
+                <ul className="mb-0 ps-3 mt-1">
+                  <li>Договор (включая доп. соглашения)</li>
+                  <li>Заявка</li>
+                  <li>Приказ о назначении ЭГ</li>
+                  <li>Файлы СТО</li>
+                  <li>Акты предыдущего аудита</li>
+                  <li>Орг. структура, Разбивка ОКВЭД, Сертификат ИГС, Расчёт трудоёмкости и пр.</li>
+                </ul>
+              </Form.Label>
               <Form.Control 
                 type="file" 
                 multiple 
@@ -620,7 +832,7 @@ function App() {
                   )}
                 </Col>
                 <Col md={4}>
-                  <strong>План (документ):</strong>{' '}
+                  <strong>План аудита:</strong>{' '}
                   {uploadedFiles.planDoc ? (
                     <Badge bg="info">{uploadedFiles.planDoc.filename || uploadedFiles.planDoc.name}</Badge>
                   ) : (

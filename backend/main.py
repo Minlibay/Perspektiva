@@ -9,6 +9,7 @@ import shutil
 import json
 import uuid
 import re
+from datetime import datetime
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
@@ -56,6 +57,51 @@ def _resolve_session_dir(session_id: Optional[str]) -> tuple[str, Path]:
 # Папка для результатов
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def _session_meta_path(session_id: str) -> Path:
+    return UPLOAD_DIR / session_id / "_meta.json"
+
+
+def _save_session_meta(session_id: str, **fields) -> None:
+    """Атомарно мержит и сохраняет meta для сессии."""
+    if not _SESSION_ID_RE.match(session_id or ""):
+        return
+    p = _session_meta_path(session_id)
+    existing = {}
+    if p.exists():
+        try:
+            existing = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+    existing.update(fields)
+    if "session_id" not in existing:
+        existing["session_id"] = session_id
+    p.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_session_meta(session_id: str) -> dict:
+    p = _session_meta_path(session_id)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _list_session_files(sdir: Path) -> list[dict]:
+    """Перечень файлов сессии (без _meta.json)."""
+    files = []
+    for f in sorted(sdir.iterdir()):
+        if f.name.startswith("_") or not f.is_file():
+            continue
+        try:
+            st = f.stat()
+            files.append({"name": f.name, "size": st.st_size, "mtime": st.st_mtime})
+        except OSError:
+            continue
+    return files
 
 # Модель GigaChat по умолчанию. Из списка доступных на ключе:
 #   "GigaChat" (Lite), "GigaChat-Pro", "GigaChat-Max",
@@ -207,9 +253,30 @@ def _collect_docx_part_text(part) -> list:
     return out
 
 
+def _open_docx_or_docm(file_path: str):
+    """python-docx падает на .docm (другой content-type main part).
+    Перепаковываем в памяти: меняем macroEnabled.main → document.main."""
+    suffix = Path(file_path).suffix.lower()
+    if suffix != ".docm":
+        return Document(file_path)
+    import zipfile
+    from io import BytesIO
+    src_macro = b"application/vnd.ms-word.document.macroEnabled.main+xml"
+    dst_main = b"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+    buf = BytesIO()
+    with zipfile.ZipFile(file_path, "r") as zin, zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                data = data.replace(src_macro, dst_main)
+            zout.writestr(item, data)
+    buf.seek(0)
+    return Document(buf)
+
+
 def extract_text_from_docx(file_path: str) -> str:
-    """Извлечение текста из .docx файла + колонтитулы + распознанные галочки/крестики."""
-    doc = Document(file_path)
+    """Извлечение текста из .docx/.docm файла + колонтитулы + распознанные галочки/крестики."""
+    doc = _open_docx_or_docm(file_path)
     texts = []
 
     for section in doc.sections:
@@ -1019,7 +1086,9 @@ def build_evidence_pack(relevant_files: list, all_texts: dict, max_chars: int = 
 
 def verify_item_strict(api_key: str, item: dict, ii_references: dict,
                         evidence: str, model: str = "GigaChat",
-                        extra_instructions: str = "") -> dict:
+                        extra_instructions: str = "",
+                        comparison: bool = False,
+                        compare_fields: str = "") -> dict:
     """
     Строгая проверка пункта чек-листа с NOK-first логикой.
     Возвращает: {ok, nok, reason, ii_data_found, evidence_quote, source_file}.
@@ -1063,12 +1132,52 @@ def verify_item_strict(api_key: str, item: dict, ii_references: dict,
   "evidence_quote": "конкретные данные/цитаты из файлов (до 350 символов), на основе которых вынесен вердикт",
   "source_file": "имя файла (или несколько через запятую) откуда взяты данные, или 'не найдено'",
   "reason": "обоснование (1-3 предложения): какие данные нашёл, как сверил, почему такой вердикт",
-  "ii_data_found": "список найденных маркеров через запятую (ИИ1, ИИ2...), или 'не найдено'"
+  "ii_data_found": "список найденных маркеров через запятую (ИИ1, ИИ2...), или 'не найдено'",
+  "extracted_values": []
 }
+
+Поле "extracted_values" заполняй ТОЛЬКО если в дополнительных правилах указан "РЕЖИМ СВЕРКИ". Иначе оставляй пустой массив [].
 
 ok и nok — взаимоисключающие: ровно один true, другой false."""
 
     extra_block = ("\n\nДОПОЛНИТЕЛЬНЫЕ ПРАВИЛА ДЛЯ ЭТОГО ПУНКТА:\n" + extra_instructions) if extra_instructions else ""
+
+    comparison_block = ""
+    if comparison:
+        fields_hint = compare_fields or "ключевые реквизиты пункта"
+        comparison_block = f"""
+
+РЕЖИМ СВЕРКИ (ОБЯЗАТЕЛЬНО):
+Этот пункт требует ПРЯМОЙ СВЕРКИ значений между двумя или более файлами ({fields_hint}).
+Прежде чем вынести вердикт — ВЫПИШИ дословные цитаты из КАЖДОГО файла-источника. Не перефразируй, не сокращай, копируй как есть. Это твоё доказательство, что ты реально посмотрел в документы.
+
+ФОРМАТ В ПОЛЕ extracted_values (массив объектов):
+[
+  {{ "field": "название поля (напр. '№ договора', 'дата договора', 'ФИО эксперта 1')",
+     "value_in_plan": "дословная цитата из Плана аудита",
+     "value_in_other": "дословная цитата из второго файла",
+     "other_file": "имя второго файла",
+     "match": true/false }},
+  ...
+]
+
+ПРАВИЛА СОВПАДЕНИЯ:
+- Номера документов и даты — сравнивай ПОСИМВОЛЬНО (после удаления пробелов и приведения к одному формату даты). Любое расхождение хотя бы в одном символе номера или одной цифре даты → match: false.
+- ФИО — нормализуй к виду "Фамилия И.О." и сравнивай. Разный человек, опечатка в фамилии, другой инициал → match: false. Допустимо только различие "Иванов И.И." vs "Иванов Иван Иванович".
+- Если значение НЕ НАЙДЕНО в одном из файлов — match: false, в недостающее поле напиши "не найдено".
+
+АНТИ-ГАЛЛЮЦИНАЦИЯ (КРИТИЧНО):
+Цитаты `value_in_plan` и `value_in_other` должны быть СКОПИРОВАНЫ БУКВА-В-БУКВУ из текста соответствующего файла, который тебе передан в evidence ниже. НЕ выдумывай номера, даты, ФИО. НЕ догадывайся по контексту или из общих знаний. НЕ "примерно", не "вероятно", не "по аналогии с другим документом".
+Если в тексте файла данного значения НЕТ — пиши ровно "не найдено" (без подмены похожим из памяти или из соседнего файла).
+Любая выдуманная цитата = провал проверки. Система будет постфактум искать каждую твою цитату в тексте файла. Если не найдёт — пункт будет помечен как фальсификация.
+
+ВЕРДИКТ:
+- OK — ТОЛЬКО если ВСЕ строки extracted_values имеют match: true.
+- NOK — если хотя бы одна строка имеет match: false, ИЛИ если массив extracted_values пуст (не смог извлечь — значит проверку не провёл).
+
+В reason кратко перечисли поля и результат сверки: "№ договора: 2604 (План) vs 2605 (Договор) — НЕ совпадает; дата: 26.04.2024 vs 26.04.2024 — совпадает".
+"""
+
     markers_str = ", ".join(ii_markers) if ii_markers else "нет"
     user_prompt = f"""ПУНКТ ДЛЯ ПРОВЕРКИ:
 ОБЛАСТЬ: {item['area']}
@@ -1081,7 +1190,7 @@ ok и nok — взаимоисключающие: ровно один true, др
 
 ДОКУМЕНТЫ-ИСТОЧНИКИ ДЛЯ ПРОВЕРКИ:
 {evidence if evidence else '(файлы не переданы)'}
-{extra_block}
+{extra_block}{comparison_block}
 
 Проведи проверку: сам сравни данные между файлами. OK — если данные есть и согласуются. NOK — только если данных нет или есть явное противоречие."""
 
@@ -1104,6 +1213,59 @@ ok и nok — взаимоисключающие: ровно один true, др
             ok, nok = True, False
         else:
             ok, nok = False, True
+    # Жёсткая пост-валидация для пунктов в режиме сверки.
+    # Цель — поймать случаи, когда модель ставит OK без реального извлечения значений
+    # или выдумывает (галлюцинирует) цитаты.
+    if comparison:
+        extracted = result.get("extracted_values") or []
+
+        def _norm(s: str) -> str:
+            # Нормализация для поиска подстроки: убираем пробелы, ё→е, lower.
+            return re.sub(r"\s+", "", (s or "").lower().replace("ё", "е"))
+
+        evidence_norm = _norm(evidence or "")
+
+        if ok and (not isinstance(extracted, list) or len(extracted) == 0):
+            ok, nok = False, True
+            result["reason"] = ("[авто-NOK: режим сверки требует извлечь и сравнить значения, "
+                                "но модель не вернула extracted_values] "
+                                + (result.get("reason") or ""))
+        elif isinstance(extracted, list) and extracted:
+            mismatches = []
+            hallucinations = []
+            for row in extracted:
+                if not isinstance(row, dict):
+                    continue
+                # 1) Проверка на галлюцинации: каждая непустая цитата должна быть в evidence.
+                for key in ("value_in_plan", "value_in_other"):
+                    raw = (row.get(key) or "").strip()
+                    if not raw or raw.lower() in ("не найдено", "—", "-", "n/a", "нет"):
+                        continue
+                    if _norm(raw) and _norm(raw) not in evidence_norm:
+                        hallucinations.append(
+                            f"{row.get('field', 'поле')} [{key}]: '{raw[:80]}' нет в тексте файлов"
+                        )
+                # 2) Сбор расхождений.
+                if row.get("match") is False:
+                    field = row.get("field", "поле")
+                    a = (row.get("value_in_plan") or "").strip()
+                    b = (row.get("value_in_other") or "").strip()
+                    other = row.get("other_file", "")
+                    mismatches.append(f"{field}: '{a}' (План) vs '{b}' ({other})")
+
+            if hallucinations:
+                ok, nok = False, True
+                result["reason"] = (
+                    "[авто-NOK: галлюцинация цитаты — значения не найдены в тексте файлов] "
+                    + "; ".join(hallucinations[:5])
+                    + (" | " + result.get("reason", "") if result.get("reason") else "")
+                )
+            elif mismatches and ok:
+                ok, nok = False, True
+                result["reason"] = ("[авто-NOK: расхождения по сверке] "
+                                    + "; ".join(mismatches[:5])
+                                    + (" | " + result.get("reason", "") if result.get("reason") else ""))
+
     result["ok"] = ok
     result["nok"] = nok
     result.setdefault("reason", result.get("evidence_quote", ""))
@@ -1115,14 +1277,41 @@ ok и nok — взаимоисключающие: ровно один true, др
 
 def adversarial_recheck(api_key: str, item: dict, ii_references: dict,
                          evidence: str, prior_verdict: dict,
-                         model: str = "GigaChat") -> dict:
+                         model: str = "GigaChat",
+                         comparison: bool = False,
+                         compare_fields: str = "") -> dict:
     """
     Второй проход для OK-вердиктов: попытаться найти причины перевести в NOK.
     Это основная защита от ложных OK.
     """
     ii_markers = item.get("ii_markers", [])
 
-    system_prompt = """Ты — второй аудитор, который делает критический ревью вердикта OK от первого аудитора. Твоя задача — объективно подтвердить OK или перевернуть в NOK, если есть СУЩЕСТВЕННЫЕ основания.
+    if comparison:
+        fields_hint = compare_fields or "ключевые реквизиты"
+        system_prompt = f"""Ты — второй аудитор, который перепроверяет вердикт OK первого аудитора по пункту, требующему ПРЯМОЙ СВЕРКИ значений между файлами ({fields_hint}).
+
+Твоя задача в этом режиме — НЕ подтверждать на доверии, а ИСКАТЬ расхождения, которые первый мог пропустить или замаскировать.
+
+ОБЯЗАТЕЛЬНО ВЫПОЛНИ:
+1. Найди в документах-источниках КАЖДОЕ значение, которое заявил первый аудитор в своём массиве extracted_values (если массив был).
+2. Сравни их сам, посимвольно для номеров/дат и в нормализованной форме "Фамилия И.О." для ФИО.
+3. Если первый аудитор НЕ предоставил extracted_values — это уже основание для NOK (он не доказал, что реально сверил).
+4. Если хотя бы одно значение не совпадает (другой номер, другая цифра в дате, другая фамилия, другой инициал, другой человек) — NOK.
+5. Если значение есть только в одном из файлов, а во втором отсутствует — NOK.
+
+ДЕФОЛТ В РЕЖИМЕ СВЕРКИ: NOK. Подтверждай OK ТОЛЬКО если ты сам перепроверил все значения и они идентичны.
+
+Верни ТОЛЬКО JSON:
+{{
+  "ok": true/false,
+  "nok": true/false,
+  "evidence_quote": "конкретные значения, которые ты сравнил, через '|' (напр. 'План: №2604 от 26.04.2024 | Договор: №2605 от 26.04.2024')",
+  "source_file": "имена файлов через запятую",
+  "reason": "если NOK — что именно не совпало. Если OK — какие значения ты сверил и подтвердил.",
+  "ii_data_found": "..."
+}}"""
+    else:
+        system_prompt = """Ты — второй аудитор, который делает критический ревью вердикта OK от первого аудитора. Твоя задача — объективно подтвердить OK или перевернуть в NOK, если есть СУЩЕСТВЕННЫЕ основания.
 
 СУЩЕСТВЕННЫЕ основания для NOK (только такие!):
 1. Первый аудитор сослался на файл/цитату, которой на самом деле нет в документах-источниках ниже.
@@ -1149,6 +1338,15 @@ def adversarial_recheck(api_key: str, item: dict, ii_references: dict,
   "ii_data_found": "..."
 }"""
 
+    prior_extracted = prior_verdict.get("extracted_values") or []
+    try:
+        import json as _json
+        prior_extracted_str = _json.dumps(prior_extracted, ensure_ascii=False, indent=2) if prior_extracted else "(не предоставлены)"
+    except Exception:
+        prior_extracted_str = "(не предоставлены)"
+
+    extracted_block = f"\nИЗВЛЕЧЁННЫЕ ИМ ЗНАЧЕНИЯ (extracted_values):\n{prior_extracted_str}\n" if comparison else ""
+
     user_prompt = f"""ПУНКТ:
 ОБЛАСТЬ: {item['area']}
 ТРЕБОВАНИЯ: {item['comments']}
@@ -1158,7 +1356,7 @@ def adversarial_recheck(api_key: str, item: dict, ii_references: dict,
 ВЕРДИКТ ПЕРВОГО АУДИТОРА: OK
 ЕГО ОБОСНОВАНИЕ: {prior_verdict.get('reason', '')}
 ЦИТАТА, КОТОРУЮ ОН ПРИВЁЛ: {prior_verdict.get('evidence_quote', '')}
-ФАЙЛ-ИСТОЧНИК: {prior_verdict.get('source_file', '')}
+ФАЙЛ-ИСТОЧНИК: {prior_verdict.get('source_file', '')}{extracted_block}
 
 ДОКУМЕНТЫ-ИСТОЧНИКИ (проверь их ещё раз):
 {evidence if evidence else '(нет)'}
@@ -1172,8 +1370,15 @@ def adversarial_recheck(api_key: str, item: dict, ii_references: dict,
         ok = bool(result.get("ok", False))
         nok = bool(result.get("nok", False))
         if ok == nok:
-            # Неоднозначный ответ ревью — оставляем исходный OK (не переворачиваем без явных оснований)
-            ok, nok = True, False
+            # Неоднозначный ответ ревью.
+            # В режиме сверки — переворачиваем в NOK (дефолт строгий).
+            # В обычном режиме — оставляем исходный OK.
+            if comparison:
+                ok, nok = False, True
+                result["reason"] = ("[авто-NOK: ревью в режиме сверки не дало однозначного подтверждения] "
+                                    + (result.get("reason") or ""))
+            else:
+                ok, nok = True, False
         result["ok"] = ok
         result["nok"] = nok
         result.setdefault("reason", prior_verdict.get("reason", ""))
@@ -1197,19 +1402,28 @@ ITEM_RULES = {
         "file_keywords": ["план"],
         "extra_instructions": (
             "Этот пункт проверяет САМ документ \"ПЛАН аудита\" (включён в evidence как файл \"ПЛАН АУДИТА (проверяемый документ)\").\n\n"
+            "ТРЕБОВАНИЕ (точная формулировка из шаблона): дата утверждения/согласования в шапке Плана должна быть НЕ ПОЗДНЕЕ 5 рабочих дней до начала аудита. "
+            "Это понимается как окно: разница между датой утверждения и датой начала аудита НЕ ДОЛЖНА ПРЕВЫШАТЬ 5 рабочих дней. "
+            "Слишком ранее утверждение (>5 рабочих дней до начала) — тоже нарушение.\n"
+            "Пример из шаблона: если начало аудита 10.02.2026, дата утверждения должна быть не раньше 03.02.2026 и не позже 10.02.2026.\n\n"
             "АЛГОРИТМ (выполни ВСЕ шаги по порядку):\n"
             "ШАГ 1. Найди в шапке/колонтитуле Плана дату утверждения/согласования (рядом со словами \"утверждаю\", \"утверждено\", \"согласовано\", \"УТВ\", \"СОГЛ\"). Запиши её как D_утв.\n"
             "ШАГ 2. Найди дату НАЧАЛА аудита (поле \"Сроки проведения аудита\"). Если указан диапазон дат — бери самую раннюю. Запиши как D_начало.\n"
             "ШАГ 3. Если D_утв или D_начало отсутствуют → NOK.\n"
             "ШАГ 4. Если D_утв >= D_начало (утверждение в день начала или ПОСЛЕ) → NOK. Утверждать после начала аудита недопустимо.\n"
-            "ШАГ 5. Посчитай число РАБОЧИХ дней (Пн–Пт, без Сб/Вс) строго МЕЖДУ D_утв и D_начало (не включая обе границы).\n"
-            "ШАГ 6. Если рабочих дней < 5 → NOK. Если рабочих дней >= 5 → OK.\n\n"
-            "В reason ОБЯЗАТЕЛЬНО приведи обе даты и явный расчёт: \"D_утв = ДД.ММ.ГГГГ, D_начало = ДД.ММ.ГГГГ, между ними N рабочих дней → OK/NOK\".\n"
+            "ШАГ 5. Посчитай число РАБОЧИХ дней (Пн–Пт, без Сб/Вс) от D_утв до D_начало включительно ПО ОДНУ из границ "
+            "(т.е. число рабочих дней между ними + 1, считая саму D_начало).\n"
+            "ШАГ 6. Если рабочих дней > 5 → NOK (утверждение слишком рано, выходит за окно). "
+            "Если рабочих дней <= 5 (и при этом D_утв < D_начало) → OK.\n\n"
+            "В reason ОБЯЗАТЕЛЬНО приведи обе даты и явный расчёт в формате: "
+            "\"D_утв = ДД.ММ.ГГГГ, D_начало = ДД.ММ.ГГГГ, разница N рабочих дней. Требование: не позднее 5 рабочих дней до начала аудита (окно ≤5). Вердикт: OK/NOK.\"\n"
             "Если расчёт не приведён — это автоматически считается ошибкой проверки."
         ),
     },
     1: {
         "file_keywords": ["оргструктур", "орг.структур", "орг структур", "организационн"],
+        "comparison": True,
+        "compare_fields": "перечень подразделений и иерархия",
         "extra_instructions": (
             "Из файла \"ПЛАН аудита\" возьми указанную организационную структуру заявителя. "
             "Найди в источниках файлы по орг.структуре и сопоставь состав/иерархию. "
@@ -1233,23 +1447,35 @@ ITEM_RULES = {
         ),
     },
     4: {
-        "file_keywords": ["оквэд", "сертификат", "игс", "разбивк"],
+        "file_keywords": ["оквэд", "сертификат", "игс", "разбивк", "макет", "область сертификаци", "область применени"],
+        "comparison": True,
+        "compare_fields": "формулировка области применения (сертификации) СМК — дословно",
         "extra_instructions": (
             "В шаблоне Плана найди строку НЕПОСРЕДСТВЕННО НАД \"область применения СМК (область сертификации)\". "
             "Эта строка должна ДОСЛОВНО (буква в букву) совпадать с формулировкой из файлов \"Разбивка кодов ОКВЭД\" "
-            "и \"Сертификат ИГС\". NOK при ЛЮБЫХ расхождениях формулировки."
+            "и \"Сертификат ИГС\". "
+            "Если в источниках нет ни «Разбивки ОКВЭД», ни «Сертификата ИГС» — поставь NOK с reason: "
+            "\"Не загружены файлы для сверки: «Разбивка кодов ОКВЭД» и/или «Сертификат ИГС»\". "
+            "«Макет сертификата» НЕ является заменой Сертификата ИГС — это только проект; "
+            "если есть только Макет — также NOK с явным указанием. "
+            "NOK при ЛЮБЫХ расхождениях формулировки."
         ),
     },
     5: {
         "file_keywords": ["договор", "доп.соглашен", "доп соглашен", "доп. соглашен"],
+        "comparison": True,
+        "compare_fields": "№ договора, дата договора, № и дата доп.соглашения (если есть)",
         "extra_instructions": (
             "В шаблоне Плана пункт 4 — \"Наименование и адрес аудитируемых производственных площадок\". "
             "Дата и № договора (а также № и дата доп.соглашения, если есть) должны совпадать с файлом \"Договор\". "
-            "NOK если номер/дата договора не совпали или не упомянуто доп.соглашение, когда оно реально присутствует в источниках."
+            "NOK если номер/дата договора не совпали или не упомянуто доп.соглашение, когда оно реально присутствует в источниках. "
+            "В extracted_values заведи ОТДЕЛЬНЫЕ строки для '№ договора', 'дата договора', и для каждого доп.соглашения — '№ доп.соглашения N', 'дата доп.соглашения N'."
         ),
     },
     6: {
         "file_keywords": ["заявка"],
+        "comparison": True,
+        "compare_fields": "наименование заявителя, объект сертификации, площадки (адреса) из заявки",
         "extra_instructions": (
             "Сравни данные пункта чек-листа с информацией из файла \"Заявка\". "
             "NOK если данные расходятся или Заявки в источниках нет."
@@ -1257,20 +1483,29 @@ ITEM_RULES = {
     },
     7: {
         "file_keywords": ["план", "приказ", "эг", "назначен"],
+        "comparison": True,
+        "compare_fields": "даты начала и окончания аудита, перечень дней",
         "extra_instructions": (
             "В шаблоне Плана найди пункт 5 \"Сроки проведения аудита\" и сравни даты с файлом \"Приказ о назначении ЭГ\". "
-            "NOK при любом расхождении дат."
+            "NOK при любом расхождении дат. "
+            "В extracted_values заведи строки 'дата начала аудита' и 'дата окончания аудита' (а если в приказе перечислены дни — то по каждому дню)."
         ),
     },
     8: {
         "file_keywords": ["план", "приказ", "эг", "назначен"],
+        "comparison": True,
+        "compare_fields": "ФИО каждого члена ЭГ, роль (руководитель / эксперт / стажёр / наблюдатель)",
         "extra_instructions": (
             "В шаблоне Плана найди раздел \"Состав экспертной группы\" (ФИО, роли). "
-            "Сравни с составом из файла \"Приказ о назначении ЭГ\". NOK при расхождении состава или ролей."
+            "Сравни с составом из файла \"Приказ о назначении ЭГ\". NOK при расхождении состава или ролей. "
+            "В extracted_values заведи отдельную строку для КАЖДОГО человека: field='ФИО — <роль>', "
+            "value_in_plan = ФИО как написано в Плане, value_in_other = ФИО как написано в Приказе. "
+            "Сравнивай нормализованно: 'Иванов И.И.' ≡ 'Иванов Иван Иванович', но 'Иванов И.И.' ≠ 'Иванов И.А.' и ≠ 'Иванова И.И.'. "
+            "Если человек есть в одном файле и нет в другом — match: false."
         ),
     },
     9: {
-        "file_keywords": ["акт", "предыдущ", "результат"],
+        "file_keywords": ["акт", "предыдущ", "результат", "сводный акт", "1 этап", "1-го этапа", "2 этап", "2-го этапа", "отчет"],
         "extra_instructions": (
             "Найди файл с \"актом по результатам предыдущего аудита\" и сравни его данные с пунктом 8 шаблона Плана. "
             "NOK при расхождениях или отсутствии акта."
@@ -1302,7 +1537,7 @@ ITEM_RULES = {
         ),
     },
     13: {
-        "file_keywords": ["акт", "предыдущ"],
+        "file_keywords": ["акт", "предыдущ", "сводный акт", "1 этап", "1-го этапа", "2 этап", "2-го этапа", "отчет"],
         "extra_instructions": (
             "Сравни процессы из файла \"акт предыдущего аудита\" с колонкой \"Пункт стандарта\" в шаблоне Плана. "
             "Все процессы из акта должны быть охвачены в колонке Плана. NOK если хотя бы один процесс из акта отсутствует."
@@ -1407,8 +1642,12 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
             evidence = build_evidence_pack(relevant, all_texts, max_chars=180000)
 
             extra_rules = ""
+            comparison_flag = False
+            compare_fields = ""
             if rule:
                 extra_rules = rule.get("extra_instructions", "")
+                comparison_flag = bool(rule.get("comparison", False))
+                compare_fields = rule.get("compare_fields", "")
                 # Для пунктов с правилами всегда добавляем текст самого Плана
                 if template_text:
                     template_block = f"=== ФАЙЛ: ПЛАН АУДИТА (проверяемый документ) ===\n{template_text[:30000]}"
@@ -1416,11 +1655,15 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
 
             processing_status["detail"] = f"проверка по {len(relevant)} файлу(ам)..."
             verdict = verify_item_strict(api_key, item, ii_references, evidence, model=model,
-                                          extra_instructions=extra_rules)
+                                          extra_instructions=extra_rules,
+                                          comparison=comparison_flag,
+                                          compare_fields=compare_fields)
 
             if verdict.get("ok"):
                 processing_status["detail"] = "adversarial-перепроверка OK-вердикта..."
-                verdict = adversarial_recheck(api_key, item, ii_references, evidence, verdict, model=model)
+                verdict = adversarial_recheck(api_key, item, ii_references, evidence, verdict, model=model,
+                                               comparison=comparison_flag,
+                                               compare_fields=compare_fields)
 
             verdict["_files_checked"] = relevant
             # Дописываем в обоснование список файлов, в которых искалась информация
@@ -1665,11 +1908,18 @@ async def create_session():
 async def upload_files(
     files: list[UploadFile] = File(...),
     session_id: Optional[str] = Form(None),
+    block: Optional[str] = Form(None),
 ):
-    """Загрузка документов (docx, docm, pdf, xlsx) в папку сессии."""
+    """Загрузка документов (docx, docm, pdf, xlsx) в папку сессии.
+    block — необязательный тэг блока в UI: 'checklist' | 'plan' | 'sources'."""
     sid, sdir = _resolve_session_dir(session_id)
 
+    meta = _load_session_meta(sid)
+    if not meta.get("created_at"):
+        _save_session_meta(sid, created_at=datetime.now().isoformat(timespec="seconds"))
+
     uploaded = []
+    block_files = list(meta.get("blocks", {}).get(block, [])) if block else []
     for file in files:
         if not file.filename:
             continue
@@ -1683,6 +1933,13 @@ async def upload_files(
             "path": str(file_path),
             "size": file_path.stat().st_size
         })
+        if block and file.filename not in block_files:
+            block_files.append(file.filename)
+
+    if block:
+        blocks = dict(meta.get("blocks") or {})
+        blocks[block] = block_files
+        _save_session_meta(sid, blocks=blocks)
 
     return {"status": "ok", "session_id": sid, "uploaded_files": uploaded, "count": len(uploaded)}
 
@@ -1712,6 +1969,22 @@ async def process_documents(
 
     if not all_docs:
         raise HTTPException(status_code=400, detail="Нет загруженных документов")
+
+    # План аудита (блок 2 в UI) обязателен — без него не с чем сравнивать.
+    if not plan_doc_file:
+        raise HTTPException(
+            status_code=400,
+            detail="Не загружен файл «План аудита» (блок 2). Без него сверка невозможна — пайплайн остановлен."
+        )
+
+    # В блок 3 должны быть источники (хотя бы 1 файл, не считая шаблон и план).
+    excluded_names = {template_file, plan_doc_file}
+    sources_count = sum(1 for d in all_docs if d.name not in excluded_names)
+    if sources_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Нет файлов-источников в блоке 3. Загрузите Договор, Приказ ЭГ, Заявку и пр. — без них сверка невозможна."
+        )
 
     # Находим шаблон плана
     template_path = sdir / template_file
@@ -1855,9 +2128,19 @@ async def process_documents(
             print(f"WARN: Не удалось прочитать файл 'План' {plan_doc_file}: {e}")
             plan_doc_text = ""
 
-    # Что использовать как "текст Плана" для evidence пунктов с правилами:
-    # приоритет — отдельный plan_doc_text, иначе template_text.
-    plan_text_for_items = plan_doc_text or template_text
+    # Текст Плана аудита для evidence пунктов с правилами.
+    # Только из загруженного в блок 2 файла. Текст чек-листа (template_text)
+    # как Plan НЕ подставляем — это сбивало модель, она писала "План пуст".
+    if not plan_doc_text or len(plan_doc_text.strip()) < 100:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Не удалось извлечь текст из файла «План аудита» ({plan_doc_file}). "
+                f"Прочитано символов: {len(plan_doc_text.strip()) if plan_doc_text else 0}. "
+                "Проверь, что в блок 2 загружен правильный файл с Планом аудита."
+            )
+        )
+    plan_text_for_items = plan_doc_text
 
     # Извлекаем структуру чек-листа из шаблона
     checklist_structure = extract_checklist_from_template(str(template_path))
@@ -1931,9 +2214,12 @@ async def process_documents(
                 if "ii_data_found" not in item:
                     item["ii_data_found"] = ""
 
-    # Формируем выходной файл
+    # Формируем выходной файл — кладём в папку сессии (имя стабильное, конкуренции нет)
+    session_out_dir = OUTPUT_DIR / session_id
+    session_out_dir.mkdir(parents=True, exist_ok=True)
     output_filename = f"Заполненный_План_АУДИТА.docx"
-    output_path = OUTPUT_DIR / output_filename
+    output_path = session_out_dir / output_filename
+    output_ref = f"{session_id}/{output_filename}"
 
     # Заполняем шаблон (шапка + чек-лист OK/NOK + Проблемные зоны)
     processing_status.update({
@@ -1963,26 +2249,162 @@ async def process_documents(
         # В будущем здесь можно добавить авто-исправление
         # Пока просто возвращаем отчёт
     
+    # Сохраняем мета-данные сессии для админки
+    try:
+        checklist_results = extracted_data.get("checklist", []) if isinstance(extracted_data, dict) else []
+        ok_count = sum(1 for it in checklist_results if it.get("ok"))
+        nok_count = sum(1 for it in checklist_results if it.get("nok"))
+        _save_session_meta(
+            session_id,
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            template_file=template_file,
+            plan_doc_file=plan_doc_file,
+            source_files=[d.name for d in source_docs if d.name != plan_doc_file],
+            output_file=output_ref,
+            model=active_model,
+            ok_count=ok_count,
+            nok_count=nok_count,
+            total_items=len(checklist_results),
+            header=extracted_data.get("header") if isinstance(extracted_data, dict) else None,
+            checklist=checklist_results,
+            validation=validation,
+        )
+    except Exception as e:
+        print(f"WARN: meta сохранить не удалось: {e}")
+
     return ProcessingResult(
         status="success",
         message=f"План заполнен. Проанализировано файлов: {len(analyzed_files)}",
         extracted_data=extracted_data,
-        output_file=output_filename,
+        output_file=output_ref,
         validation=validation,
         analyzed_files=analyzed_files
     )
 
 
-@app.get("/api/download/{filename}")
+@app.get("/api/admin/sessions")
+async def admin_list_sessions(limit: int = 50):
+    """Список сессий с краткой сводкой, отсортирован по времени убывания."""
+    items = []
+    for sdir in UPLOAD_DIR.iterdir():
+        if not sdir.is_dir() or not _SESSION_ID_RE.match(sdir.name):
+            continue
+        meta = _load_session_meta(sdir.name)
+        files = _list_session_files(sdir)
+        ts = meta.get("finished_at") or meta.get("created_at") or ""
+        if not ts:
+            try:
+                ts = datetime.fromtimestamp(sdir.stat().st_mtime).isoformat(timespec="seconds")
+            except OSError:
+                ts = ""
+        items.append({
+            "session_id": sdir.name,
+            "created_at": meta.get("created_at"),
+            "finished_at": meta.get("finished_at"),
+            "ts_sort": ts,
+            "files_count": len(files),
+            "ok_count": meta.get("ok_count"),
+            "nok_count": meta.get("nok_count"),
+            "total_items": meta.get("total_items"),
+            "model": meta.get("model"),
+            "output_file": meta.get("output_file"),
+            "applicant": (meta.get("header") or {}).get("Наименование Заявителя") if meta.get("header") else None,
+        })
+    items.sort(key=lambda x: x.get("ts_sort") or "", reverse=True)
+    return {"sessions": items[:limit], "total": len(items)}
+
+
+@app.get("/api/admin/sessions/{session_id}")
+async def admin_get_session(session_id: str):
+    """Детали сессии: meta + список всех файлов."""
+    if not _SESSION_ID_RE.match(session_id or ""):
+        raise HTTPException(status_code=400, detail="Некорректный session_id")
+    sdir = UPLOAD_DIR / session_id
+    if not sdir.is_dir():
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    meta = _load_session_meta(session_id)
+    files = _list_session_files(sdir)
+    out_dir = OUTPUT_DIR / session_id
+    output_files = []
+    if out_dir.is_dir():
+        for f in sorted(out_dir.iterdir()):
+            if f.is_file():
+                try:
+                    output_files.append({"name": f.name, "size": f.stat().st_size,
+                                         "ref": f"{session_id}/{f.name}"})
+                except OSError:
+                    pass
+    return {"session_id": session_id, "meta": meta, "files": files, "output_files": output_files}
+
+
+@app.get("/api/admin/sessions/{session_id}/zip")
+async def admin_download_zip(session_id: str):
+    """Скачать ZIP-архив со всеми файлами сессии + результатом + meta.json."""
+    if not _SESSION_ID_RE.match(session_id or ""):
+        raise HTTPException(status_code=400, detail="Некорректный session_id")
+    sdir = UPLOAD_DIR / session_id
+    if not sdir.is_dir():
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    import zipfile, tempfile
+    tmp = tempfile.NamedTemporaryFile(prefix=f"session_{session_id}_", suffix=".zip", delete=False)
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in sdir.iterdir():
+                if f.is_file():
+                    zf.write(f, arcname=f"inputs/{f.name}")
+            out_dir = OUTPUT_DIR / session_id
+            if out_dir.is_dir():
+                for f in out_dir.iterdir():
+                    if f.is_file():
+                        zf.write(f, arcname=f"outputs/{f.name}")
+        return FileResponse(
+            path=tmp.name,
+            filename=f"session_{session_id}.zip",
+            media_type="application/zip",
+        )
+    except Exception as e:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"Не удалось собрать zip: {e}")
+
+
+@app.delete("/api/admin/sessions/{session_id}")
+async def admin_delete_session(session_id: str):
+    """Удалить папку сессии (входы) + папку результатов."""
+    if not _SESSION_ID_RE.match(session_id or ""):
+        raise HTTPException(status_code=400, detail="Некорректный session_id")
+    sdir = UPLOAD_DIR / session_id
+    out_dir = OUTPUT_DIR / session_id
+    removed = []
+    for d in (sdir, out_dir):
+        if d.is_dir():
+            try:
+                shutil.rmtree(d)
+                removed.append(str(d.name))
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"Не удалось удалить {d}: {e}")
+    return {"status": "ok", "removed": removed}
+
+
+@app.get("/api/download/{filename:path}")
 async def download_file(filename: str):
-    """Скачивание готового файла"""
-    file_path = OUTPUT_DIR / filename
-    if not file_path.exists():
+    """Скачивание готового файла. filename может быть '<session_id>/<file>'."""
+    file_path = (OUTPUT_DIR / filename).resolve()
+    # Защита от path traversal — file_path должен быть внутри OUTPUT_DIR.
+    try:
+        file_path.relative_to(OUTPUT_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Некорректный путь")
+    if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Файл не найден")
-    
+
     return FileResponse(
         path=str(file_path),
-        filename=filename,
+        filename=file_path.name,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
 
@@ -2048,6 +2470,7 @@ async def delete_file(filename: str, session_id: Optional[str] = None):
 async def upload_from_path(
     source_path: str = Form(...),
     session_id: Optional[str] = Form(None),
+    block: Optional[str] = Form(None),
 ):
     """Загрузка документов из указанной папки (все форматы) в папку сессии."""
     if os.environ.get("ENABLE_LOCAL_UPLOAD", "0") != "1":
@@ -2057,6 +2480,11 @@ async def upload_from_path(
         raise HTTPException(status_code=400, detail="Путь не существует")
 
     sid, sdir = _resolve_session_dir(session_id)
+
+    meta = _load_session_meta(sid)
+    if not meta.get("created_at"):
+        _save_session_meta(sid, created_at=datetime.now().isoformat(timespec="seconds"))
+    block_files = list(meta.get("blocks", {}).get(block, [])) if block else []
 
     uploaded = []
     extensions = ['*.docx', '*.docm', '*.pdf', '*.xlsx']
@@ -2069,6 +2497,13 @@ async def upload_from_path(
                 "path": str(dest),
                 "size": dest.stat().st_size
             })
+            if block and doc_file.name not in block_files:
+                block_files.append(doc_file.name)
+
+    if block:
+        blocks = dict(meta.get("blocks") or {})
+        blocks[block] = block_files
+        _save_session_meta(sid, blocks=blocks)
 
     return {"status": "ok", "session_id": sid, "uploaded_files": uploaded, "count": len(uploaded)}
 
