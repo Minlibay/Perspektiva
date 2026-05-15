@@ -496,8 +496,9 @@ def extract_checklist_from_template(template_path: str) -> list[dict]:
         first_row = table.rows[0]
         cells_text = [cell.text.strip() for cell in first_row.cells]
         
-        # Ищем таблицу чек-листа (5 колонок, заголовок "Область проверки")
-        if len(first_row.cells) == 5 and "Область проверки" in cells_text:
+        # Ищем таблицу чек-листа (>=5 колонок, заголовок "Область проверки").
+        # Шаблон бывает на 5 колонок (старый) или 7 (добавились "Доки" и "№").
+        if len(first_row.cells) >= 5 and "Область проверки" in cells_text:
             # Пропускаем заголовок, начинаем с row_idx=1
             for row_idx, row in enumerate(table.rows[1:], start=1):
                 area = row.cells[0].text.strip()
@@ -616,8 +617,8 @@ def fill_plan_with_checklist(template_path: str, extracted_data: dict, output_pa
                                     run.font.size = Pt(10)
                                 break
         
-        # === ЧЕК-ЛИСТ (5 колонок, заголовок "Область проверки") ===
-        elif cols_count == 5 and "Область проверки" in first_cell_text:
+        # === ЧЕК-ЛИСТ (>=5 колонок, заголовок "Область проверки") ===
+        elif cols_count >= 5 and "Область проверки" in first_cell_text:
             # Пропускаем заголовок (row_idx=0), начинаем с row_idx=1
             for row in table.rows[1:]:
                 if checklist_item_idx >= len(checklist_data):
@@ -1829,7 +1830,7 @@ def validate_filled_document(output_path: str, checklist_structure: list[dict], 
                             warnings.append(f"Поле шапки '{expected_field}' возможно не заполнено")
         
         # === Проверка чек-листа ===
-        if cols_count == 5 and "Область проверки" in first_cell_text:
+        if cols_count >= 5 and "Область проверки" in first_cell_text:
             row_idx = 0
             for row in table.rows[1:]:  # Пропускаем заголовок
                 row_idx += 1
@@ -1917,7 +1918,7 @@ async def validate_result(filename: str):
                     if any(k in text for k in ["Заявител", "Вид аудита", "Даты", "РЭГ"]):
                         header_filled.append(bool(right and len(right) > 2))
             
-            if cols == 5:
+            if cols >= 5:
                 first_cell = table.rows[0].cells[0].text.strip()
                 if "Область проверки" in first_cell:
                     for row in table.rows[1:]:
