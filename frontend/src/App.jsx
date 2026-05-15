@@ -1054,41 +1054,46 @@ function App() {
                       📥 Скачать заполненный план
                     </Button>
                     
-                    {result.validation && (
-                      <Card className={`mt-3 ${result.validation.valid ? 'border-success' : 'border-danger'}`}>
-                        <Card.Header className={result.validation.valid ? 'bg-success text-white' : 'bg-warning text-dark'}>
-                          ✓ Результат валидации
-                        </Card.Header>
-                        <Card.Body>
-                          <Row>
-                            <Col md={4}>
-                              <strong>Шапка:</strong> {result.validation.header_filled || '—'}
-                            </Col>
-                            <Col md={4}>
-                              <strong>Чек-лист:</strong> {result.validation.checklist_total || 0} строк
-                            </Col>
-                            <Col md={4}>
-                              <Badge bg="success" className="me-2">OK: {result.validation.ok_count || 0}</Badge>
-                              <Badge bg="danger">NOK: {result.validation.nok_count || 0}</Badge>
-                            </Col>
-                          </Row>
-                          {result.validation.valid ? (
-                            <Alert variant="success" className="mt-2 mb-0">
-                              ✓ Документ заполнен корректно, проблем не обнаружено
-                            </Alert>
-                          ) : (
-                            <Alert variant="warning" className="mt-2 mb-0">
-                              <strong>Обнаружены проблемы:</strong>
-                              <ul className="mb-0">
-                                {result.validation.issues.map((issue, idx) => (
-                                  <li key={idx}>{issue}</li>
-                                ))}
-                              </ul>
-                            </Alert>
-                          )}
-                        </Card.Body>
-                      </Card>
-                    )}
+                    {result.validation && (() => {
+                      const v = result.validation
+                      const issues = Array.isArray(v.issues) ? v.issues : []
+                      const isOk = v.valid && issues.length === 0
+                      return (
+                        <Card className={`mt-3 ${isOk ? 'border-success' : 'border-danger'}`}>
+                          <Card.Header className={isOk ? 'bg-success text-white' : 'bg-danger text-white'}>
+                            {isOk ? '✓ Результат валидации' : '✗ Результат валидации — есть проблемы'}
+                          </Card.Header>
+                          <Card.Body>
+                            <Row>
+                              <Col md={4}>
+                                <strong>Шапка:</strong> {v.header_filled || '—'}
+                              </Col>
+                              <Col md={4}>
+                                <strong>Чек-лист:</strong> {v.checklist_total || 0} строк
+                              </Col>
+                              <Col md={4}>
+                                <Badge bg="success" className="me-2">OK: {v.ok_count || 0}</Badge>
+                                <Badge bg="danger">NOK: {v.nok_count || 0}</Badge>
+                              </Col>
+                            </Row>
+                            {isOk ? (
+                              <Alert variant="success" className="mt-2 mb-0">
+                                ✓ Все пункты OK, замечаний нет
+                              </Alert>
+                            ) : (
+                              <Alert variant="warning" className="mt-2 mb-0">
+                                <strong>Обнаружены проблемы:</strong>
+                                <ul className="mb-0">
+                                  {issues.length > 0
+                                    ? issues.map((issue, idx) => <li key={idx}>{issue}</li>)
+                                    : <li>Документ не прошёл валидацию (детали отсутствуют)</li>}
+                                </ul>
+                              </Alert>
+                            )}
+                          </Card.Body>
+                        </Card>
+                      )
+                    })()}
                   </>
                 )}
               </Card.Body>

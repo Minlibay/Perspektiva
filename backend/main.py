@@ -1942,13 +1942,27 @@ async def validate_result(filename: str):
                 issues.append(f"Строка {i+1}: ОБА маркера OK и NOK")
             elif row["none"]:
                 issues.append(f"Строка {i+1}: НЕТ маркера")
-        
+
+        # Структурные проблемы заполнения
+        if len(checklist_rows) == 0:
+            issues.append("Чек-лист не распознан: ни одной строки не найдено (проверь шаблон)")
+        if header_filled and not all(header_filled):
+            missing = len(header_filled) - sum(header_filled)
+            issues.append(f"Шапка заполнена не полностью: {missing} из {len(header_filled)} полей пусты")
+
+        ok_count = sum(1 for r in checklist_rows if r["ok"])
+        nok_count = sum(1 for r in checklist_rows if r["nok"])
+
+        # NOK в чек-листе — это содержательная проблема, тоже отражаем как issue.
+        if nok_count > 0:
+            issues.append(f"Обнаружены замечания (NOK): {nok_count} из {len(checklist_rows)} пунктов")
+
         return {
             "valid": len(issues) == 0,
             "header_filled": f"{sum(header_filled)}/{len(header_filled)} полей",
             "checklist_total": len(checklist_rows),
-            "ok_count": sum(1 for r in checklist_rows if r["ok"]),
-            "nok_count": sum(1 for r in checklist_rows if r["nok"]),
+            "ok_count": ok_count,
+            "nok_count": nok_count,
             "issues": issues
         }
     except Exception as e:
