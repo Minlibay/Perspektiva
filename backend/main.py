@@ -909,6 +909,36 @@ def _find_plan_applicant(plan_text: str) -> str:
     return ""
 
 
+_STANDARD_OPFS = {"ооо", "оао", "зао", "пао", "нао", "ао", "ип"}
+
+
+def _find_plan_opf_typos(plan_text: str) -> list[str]:
+    """Найти в Плане упоминания ОПФ, которые не входят в стандартный список (ПААО, ОООО, АОО...).
+
+    Возвращает список уникальных 'ОПФ «Название»', отсортирован по первому появлению.
+    Использует тот же чёрный список (КЦ/Перспектива/ОС СМК), чтобы не ловить орган по сертификации.
+    """
+    if not plan_text:
+        return []
+    blacklist = ("кц", "перспектива", "ос смк", "орган по сертифик", "интергазсерт")
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for m in re.finditer(r'\b([А-ЯЁ]{2,6})\s+[«"]([^»"\n]{2,80})[»"]', plan_text[:30000]):
+        opf_raw = m.group(1)
+        name = m.group(2)
+        full = f'{opf_raw} «{name}»'
+        full_lc = full.lower()
+        if any(b in full_lc for b in blacklist):
+            continue
+        if opf_raw.lower() in _STANDARD_OPFS:
+            continue
+        # Это нестандартная ОПФ — кандидат на опечатку.
+        if full not in seen_set:
+            seen_set.add(full)
+            seen.append(full)
+    return seen
+
+
 def _find_plan_audit_dates(plan_text: str) -> str:
     """Достать строку дат после 'Сроки проведения аудита' из Плана."""
     if not plan_text:
@@ -1099,6 +1129,13 @@ def cross_check_applicant_name(api_key: str, plan_text: str, sources_texts: dict
         det_plan = _find_plan_applicant(plan_text)
         if det_plan:
             plan_name = det_plan
+
+        # Отдельно ищем в Плане НЕСТАНДАРТНЫЕ ОПФ (ПААО, ОООО, АОО и т.п.) — это явные
+        # опечатки, которые надо вынести в примечание независимо от итога сравнения.
+        opf_typos = _find_plan_opf_typos(plan_text)
+        if opf_typos:
+            # Подставляем первую опечатку как plan_name, чтобы сравнение точно дало mismatch.
+            plan_name = opf_typos[0]
 
         not_found = {"не найдено", "не указано", "отсутствует", ""}
         plan_missing = plan_name.lower() in not_found
@@ -2118,18 +2155,27 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
 
             # Детерминированные пост-проверки по конкретным пунктам.
             # Пункт 4 (idx=3): вид аудита — в Плане обязана стоять галочка (☑/☒).
-            # Если в evidence Плана все чекбоксы ☐ — модель может «не заметить», принудительно NOK.
+            # Считаем ТОЛЬКО в секции «ОТМЕТКИ» Плана, чтобы не зацепить ✓/✗ из расписания
+            # или из OCR Приказа, и не считать обычные «галочки» (✓/✗) — только настоящие
+            # боксы ☑/☒.
             if idx == 3 and evidence:
-                checked = sum(evidence.count(s) for s in ('☑', '☒', '✓', '✔', '✕', '✗'))
-                unchecked = evidence.count('☐')
-                if unchecked > 0 and checked == 0:
-                    verdict["ok"] = False
-                    verdict["nok"] = True
-                    verdict["reason"] = (
-                        f"[авто-NOK: в Плане в блоке '1 Цель и область аудита' ВСЕ чекбоксы "
-                        f"не отмечены (☐×{unchecked}, отмеченных ☑/☒×0). Вид аудита обязан быть выбран галочкой.] "
-                        + (verdict.get("reason") or "")
-                    )
+                otmetki_re = re.compile(
+                    r"===[^=]*ОТМЕТК[ИИ][^=]*===([\s\S]*?)(?:===|\Z)",
+                    re.IGNORECASE
+                )
+                otmetki_match = otmetki_re.search(evidence)
+                if otmetki_match:
+                    block = otmetki_match.group(1)
+                    checked = block.count('☑') + block.count('☒')
+                    unchecked = block.count('☐')
+                    if unchecked > 0 and checked == 0:
+                        verdict["ok"] = False
+                        verdict["nok"] = True
+                        verdict["reason"] = (
+                            f"[авто-NOK: в Плане в секции «ОТМЕТКИ» ни одного отмеченного чекбокса "
+                            f"(☐×{unchecked}, ☑/☒×0). Вид аудита обязан быть выбран галочкой — "
+                            f"если модель сказала иначе, это ошибка распознавания.]"
+                        )
 
             # Пункт 12 (idx=11): совещания. Модель часто цепляется за маркеры ИИ13/ИИ9
             # из problems_hint и заявляет «отсутствует», даже когда в Плане совещания есть.
