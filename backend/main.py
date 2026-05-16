@@ -912,6 +912,46 @@ def _find_plan_applicant(plan_text: str) -> str:
 _STANDARD_OPFS = {"ооо", "оао", "зао", "пао", "нао", "ао", "ип"}
 
 
+def _detect_audit_type(all_texts: dict) -> str:
+    """Детерминированно определить «Вид аудита» из Приказа ЭГ (приоритет) или Расчёта трудоёмкости.
+
+    Модель часто хватает первое попавшееся слово вида аудита из перечня в Плане,
+    игнорируя что галочка не стоит. В Приказе ЭГ формулировка стандартная и однозначная.
+    """
+    prikaz_text = ""
+    raschet_text = ""
+    for fname, text in all_texts.items():
+        lf = fname.lower()
+        if not text:
+            continue
+        if not prikaz_text and ("приказ" in lf or " эг" in lf or "_эг" in lf or "назнач" in lf):
+            prikaz_text = text
+        if not raschet_text and ("трудоемкост" in lf or "трудоёмкост" in lf):
+            raschet_text = text
+
+    # Паттерны в порядке приоритета (специфичные → общие).
+    patterns = [
+        (r"внеплановы\w*\s+инспекционн\w*\s+контрол", "Внеплановый инспекционный контроль"),
+        (r"(?<!\d)2\s*ик\b|втор\w+\s+инспекционн\w*\s+контрол", "Второй инспекционный контроль"),
+        (r"(?<!\d)1\s*ик\b|перв\w+\s+инспекционн\w*\s+контрол", "Первый инспекционный контроль"),
+        (r"ресертификационн\w*\s+аудит", "Ресертификационный аудит"),
+        (r"расширени\w*\s+области\s+сертификаци", "Расширение области сертификации"),
+        (r"дополнительн\w*\s+аудит", "Дополнительный аудит"),
+        (r"втор\w+\s+этап\s+первичного", "Второй этап первичного сертификационного аудита"),
+        (r"перв\w+\s+этап\s+первичного", "Первый этап первичного сертификационного аудита"),
+        (r"сертификационн\w*\s+аудит", "Сертификационный аудит"),
+    ]
+
+    for source_text in (prikaz_text, raschet_text):
+        if not source_text:
+            continue
+        low = source_text.lower()
+        for rx, label in patterns:
+            if re.search(rx, low):
+                return label
+    return ""
+
+
 def _find_plan_opf_typos(plan_text: str) -> list[str]:
     """Найти в Плане упоминания ОПФ, которые не входят в стандартный список (ПААО, ОООО, АОО...).
 
@@ -1012,6 +1052,12 @@ def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") 
         if det_dates and (not cur_dates or cur_dates in ("не найдено", "—", "-")):
             result["Даты проведения"] = det_dates
         print(f"[header] детерминированно: applicant='{det_applicant}', dates='{det_dates}'")
+
+    # Вид аудита — из Приказа ЭГ / Расчёта трудоёмкости (надёжнее, чем модель по Плану).
+    det_audit_type = _detect_audit_type(all_texts)
+    if det_audit_type:
+        result["Вид аудита"] = det_audit_type
+        print(f"[header] детерминированно: audit_type='{det_audit_type}'")
 
     # Дефолты если ничего не нашли
     for key in ("Наименование Заявителя", "Вид аудита", "Даты проведения", "РЭГ"):
