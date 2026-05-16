@@ -889,11 +889,15 @@ def _parse_json_response(text: str) -> dict:
 
 def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") -> dict:
     """Извлечь данные шапки (Заявитель, Вид аудита, Даты, РЭГ) из пакета документов."""
-    # Строим компактный пакет: первые 3000 символов каждого файла
+    # Бюджет на файл: Плану даём больше, потому что в начале повторяется
+    # перечень продукции (структура таблицы) и нужные поля «Сроки проведения»,
+    # «Состав ЭГ» оказываются глубоко в тексте.
     summaries = []
     for fname, text in all_texts.items():
-        summaries.append(f"=== {fname} ===\n{text[:3000]}")
-    combined = "\n\n".join(summaries)[:80000]
+        is_plan = "план" in fname.lower()
+        budget = 20000 if is_plan else 3000
+        summaries.append(f"=== {fname} ===\n{text[:budget]}")
+    combined = "\n\n".join(summaries)[:120000]
 
     system_prompt = """Ты извлекаешь 4 поля для ШАПКИ Плана АУДИТА из документов.
 
@@ -1361,8 +1365,24 @@ ok и nok — взаимоисключающие: ровно один true, др
               "Верни КОРОТКИЙ и ПОЛНОСТЬЮ валидный JSON. Закрой все скобки. "
               "Не приводи лишних цитат — только обязательные поля."
         )
-        response = _gigachat_call(api_key, system_prompt, retry_user, model=model, max_tokens=6000)
-        result = _parse_json_response(response)
+        try:
+            response = _gigachat_call(api_key, system_prompt, retry_user, model=model, max_tokens=6000)
+            result = _parse_json_response(response)
+        except (ValueError, Exception) as e2:
+            print(f"[verify_item] Ретрай тоже упал ({str(e2)[:100]}). Graceful NOK.")
+            return {
+                "ok": False,
+                "nok": True,
+                "reason": (
+                    "[авто-NOK: модель дважды вернула невалидный JSON. "
+                    f"Последняя ошибка: {str(e2)[:120]}. "
+                    "Содержательную проверку провести не удалось — рекомендуется ручная сверка пункта.]"
+                ),
+                "evidence_quote": "",
+                "source_file": "—",
+                "ii_data_found": ", ".join(ii_markers) if ii_markers else "нет",
+                "extracted_values": [],
+            }
 
     # Нормализация: ровно один из ok/nok должен быть true.
     # При неоднозначности — NOK (нет уверенного подтверждения).
@@ -1917,16 +1937,40 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
             rule = ITEM_RULES.get(idx)
             file_names = list(all_texts.keys())
 
+            keyword_hit = False
             if rule and rule.get("file_keywords"):
                 # Детерминированный отбор по ключевым подстрокам в имени файла
                 relevant = _files_by_keyword(file_names, rule["file_keywords"])
-                if not relevant:
+                if relevant:
+                    keyword_hit = True
+                else:
                     # Фоллбэк: общий поиск по разделу/ключевым словам
                     relevant = find_relevant_files_for_item(item, all_texts)
             else:
                 relevant = find_relevant_files_for_item(item, all_texts)
 
-            print(f"[item {idx+1}/{total}] релевантных файлов: {len(relevant)}")
+            print(f"[item {idx+1}/{total}] релевантных файлов: {len(relevant)} (keyword_hit={keyword_hit})")
+
+            # Быстрый NOK без вызова модели: пункт в режиме сверки, а целевого файла-источника нет.
+            # Раньше в таких случаях модель уходила в режим comparison и часто возвращала битый JSON.
+            if rule and rule.get("comparison") and rule.get("file_keywords") and not keyword_hit:
+                kw_display = ", ".join(rule["file_keywords"][:5])
+                checklist_results.append({
+                    "ok": False,
+                    "nok": True,
+                    "reason": (
+                        f"[авто-NOK: не загружен файл-источник для сверки. "
+                        f"Ожидалось имя с подстрокой из: {kw_display}. "
+                        f"Проверка содержательно невозможна.]"
+                    ),
+                    "ii_data_found": ", ".join(item.get("ii_markers", [])) or "не найдено",
+                    "evidence_quote": "",
+                    "source_file": "не найдено",
+                    "_files_checked": [],
+                })
+                print(f"[item {idx+1}/{total}] NOK (нет файла-источника по ключевым словам)")
+                continue
+
             evidence = build_evidence_pack(relevant, all_texts, max_chars=180000)
 
             extra_rules = ""
