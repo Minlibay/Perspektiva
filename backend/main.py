@@ -912,13 +912,60 @@ def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") 
     return _parse_json_response(response)
 
 
+_OPF_EXPANSIONS = [
+    ("публичное акционерное общество", "пао"),
+    ("непубличное акционерное общество", "нао"),
+    ("акционерное общество", "ао"),
+    ("общество с ограниченной ответственностью", "ооо"),
+    ("закрытое акционерное общество", "зао"),
+    ("открытое акционерное общество", "оао"),
+    ("индивидуальный предприниматель", "ип"),
+]
+
+
+def _normalize_applicant_name(name: str) -> tuple[str, str]:
+    """Нормализует наименование юр.лица.
+
+    Возвращает (opf, core) — токен ОПФ (ооо/ао/пао/...) и «ядро» (название без ОПФ, без кавычек/пробелов).
+    Любое отклонение в ОПФ (ПААО vs ПАО) или в ядре (Ромашкаа vs Ромашка) даст разные значения.
+    """
+    if not name:
+        return ("", "")
+    s = name.lower().strip()
+    # убираем все виды кавычек и лишние знаки
+    for ch in ['«', '»', '"', '"', '"', "'", '`', '(', ')', '\n', '\t']:
+        s = s.replace(ch, ' ')
+    # схлопываем пробелы
+    s = re.sub(r'\s+', ' ', s).strip()
+
+    # развёрнутая ОПФ → аббревиатура (сравниваем полные формы до коротких, чтобы «акционерное общество» не съело «публичное акционерное общество»)
+    opf = ""
+    for full, short in _OPF_EXPANSIONS:
+        if s.startswith(full + ' ') or s == full:
+            opf = short
+            s = s[len(full):].strip()
+            break
+    if not opf:
+        # Если ОПФ-аббревиатура — первое короткое «слово» (2–6 букв) перед названием.
+        # Сюда попадает и валидное «ПАО», и опечатки вида «ПААО» — то, что и нужно ловить.
+        parts = s.split(' ', 1)
+        head = parts[0]
+        if 2 <= len(head) <= 6 and head.isalpha():
+            opf = head
+            s = parts[1] if len(parts) > 1 else ''
+
+    # ядро — буквы и цифры (выкидываем пунктуацию и пробелы для устойчивого сравнения)
+    core = re.sub(r'[^0-9a-zа-яё]+', '', s)
+    return (opf, core)
+
+
 def cross_check_applicant_name(api_key: str, plan_text: str, sources_texts: dict,
                                 model: str = "GigaChat") -> Optional[dict]:
     """Сравнить наименование юр.лица заявителя между блоком 2 (План аудита) и блоком 3 (источники).
 
-    Возвращает dict {plan_name, sources_name, match: bool, note: str} либо None при ошибке/нехватке данных.
-    Сравнение делегируется модели: ООО «Ромашка» ≡ Общество с ограниченной ответственностью «Ромашка»,
-    но опечатка/другая ОПФ/другое юр.лицо → match=false.
+    Возвращает dict {plan_name, sources_name, match, note, plan_norm, sources_norm} либо None.
+    Решение о match принимается ДЕТЕРМИНИРОВАННО локально (нормализация ОПФ + ядро),
+    модели доверяем только извлечение текста наименования.
     """
     if not plan_text or not sources_texts:
         return None
@@ -933,26 +980,18 @@ def cross_check_applicant_name(api_key: str, plan_text: str, sources_texts: dict
     if not sources_excerpt:
         return None
 
-    system_prompt = """Ты сверяешь наименование юридического лица (заявителя СМК) между двумя источниками.
+    system_prompt = """Ты извлекаешь наименование юридического лица (заявителя СМК) из двух источников.
+
+ВАЖНО: ты НИЧЕГО НЕ СРАВНИВАЕШЬ и НЕ НОРМАЛИЗУЕШЬ. Просто выпиши строки ТОЧНО так, как они написаны в документах, со всеми буквами и ОПФ. Если в Плане написано «ПААО Ромашка» — ты пишешь именно «ПААО Ромашка», даже если это похоже на опечатку.
 
 ЗАДАЧА:
-1) Из БЛОКА 2 (текст «Плана аудита») извлеки полное наименование организации-заявителя.
-2) Из БЛОКА 3 (тексты файлов-источников: Заявка, Договор, Приказ и т.п.) извлеки полное наименование заявителя.
-3) Сравни их по существу.
-
-ПРАВИЛА СРАВНЕНИЯ:
-- «ООО "Ромашка"» ≡ «Общество с ограниченной ответственностью "Ромашка"» — это одно и то же. match=true.
-- Разная ОПФ (ООО vs АО vs ИП) — match=false.
-- Опечатка в названии (хотя бы одна лишняя/пропущенная/изменённая буква в значимой части) — match=false.
-- Разные кавычки/регистр/пробелы — НЕ считаются расхождением.
-- Если в одном из блоков наименование не найдено — match=null, в note напиши какой источник пуст.
+1) Из БЛОКА 2 (текст «Плана аудита») выпиши наименование организации-заявителя дословно.
+2) Из БЛОКА 3 (Заявка, Договор, Приказ и т.п.) выпиши наименование заявителя дословно. Если в разных файлах оно разное — приведи самое полное.
 
 Верни ТОЛЬКО JSON:
 {
-  "plan_name": "наименование как в Плане (или 'не найдено')",
-  "sources_name": "наименование как в источниках (или 'не найдено')",
-  "match": true | false | null,
-  "note": "если match=false — короткое описание расхождения (что именно отличается); если match=true или null — пустая строка"
+  "plan_name": "точная строка из Плана (или 'не найдено')",
+  "sources_name": "точная строка из источников (или 'не найдено')"
 }"""
 
     user_prompt = f"""БЛОК 2 — ПЛАН АУДИТА:
@@ -964,15 +1003,47 @@ def cross_check_applicant_name(api_key: str, plan_text: str, sources_texts: dict
 {sources_excerpt}"""
 
     try:
-        response = _gigachat_call(api_key, system_prompt, user_prompt, model=model, max_tokens=400)
+        response = _gigachat_call(api_key, system_prompt, user_prompt, model=model, max_tokens=300)
         result = _parse_json_response(response)
         if not isinstance(result, dict):
             return None
+        plan_name = str(result.get("plan_name") or "").strip()
+        sources_name = str(result.get("sources_name") or "").strip()
+
+        not_found = {"не найдено", "не указано", "отсутствует", ""}
+        plan_missing = plan_name.lower() in not_found
+        src_missing = sources_name.lower() in not_found
+
+        if plan_missing or src_missing:
+            match = None
+            note = ""
+            if plan_missing and src_missing:
+                note = "наименование не найдено ни в Плане, ни в источниках"
+            elif plan_missing:
+                note = "наименование не найдено в Плане"
+            else:
+                note = "наименование не найдено в источниках"
+        else:
+            plan_opf, plan_core = _normalize_applicant_name(plan_name)
+            src_opf, src_core = _normalize_applicant_name(sources_name)
+            opf_match = (plan_opf == src_opf)
+            core_match = (plan_core == src_core)
+            match = opf_match and core_match
+            note = ""
+            if not match:
+                parts = []
+                if not opf_match:
+                    parts.append(f"ОПФ отличается: «{plan_opf or '?'}» vs «{src_opf or '?'}»")
+                if not core_match:
+                    parts.append(f"название отличается: «{plan_core}» vs «{src_core}»")
+                note = "; ".join(parts)
+
+        print(f"[applicant-crosscheck] plan='{plan_name}' src='{sources_name}' match={match}")
         return {
-            "plan_name": str(result.get("plan_name") or "").strip(),
-            "sources_name": str(result.get("sources_name") or "").strip(),
-            "match": result.get("match"),
-            "note": str(result.get("note") or "").strip(),
+            "plan_name": plan_name,
+            "sources_name": sources_name,
+            "match": match,
+            "note": note,
         }
     except Exception as e:
         print(f"[applicant-crosscheck] Ошибка: {e}")
