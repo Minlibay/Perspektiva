@@ -1057,6 +1057,7 @@ function App() {
                     {result.validation && (() => {
                       const v = result.validation
                       const issues = Array.isArray(v.issues) ? v.issues : []
+                      const notes = Array.isArray(v.notes) ? v.notes : []
                       const isOk = v.valid && issues.length === 0
                       return (
                         <Card className={`mt-3 ${isOk ? 'border-success' : 'border-danger'}`}>
@@ -1087,6 +1088,14 @@ function App() {
                                   {issues.length > 0
                                     ? issues.map((issue, idx) => <li key={idx}>{issue}</li>)
                                     : <li>Документ не прошёл валидацию (детали отсутствуют)</li>}
+                                </ul>
+                              </Alert>
+                            )}
+                            {notes.length > 0 && (
+                              <Alert variant="info" className="mt-2 mb-0">
+                                <strong>Доп. примечания:</strong>
+                                <ul className="mb-0">
+                                  {notes.map((n, idx) => <li key={idx}>{n}</li>)}
                                 </ul>
                               </Alert>
                             )}

@@ -912,6 +912,73 @@ def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") 
     return _parse_json_response(response)
 
 
+def cross_check_applicant_name(api_key: str, plan_text: str, sources_texts: dict,
+                                model: str = "GigaChat") -> Optional[dict]:
+    """Сравнить наименование юр.лица заявителя между блоком 2 (План аудита) и блоком 3 (источники).
+
+    Возвращает dict {plan_name, sources_name, match: bool, note: str} либо None при ошибке/нехватке данных.
+    Сравнение делегируется модели: ООО «Ромашка» ≡ Общество с ограниченной ответственностью «Ромашка»,
+    но опечатка/другая ОПФ/другое юр.лицо → match=false.
+    """
+    if not plan_text or not sources_texts:
+        return None
+
+    plan_excerpt = plan_text[:6000]
+    src_summaries = []
+    for fname, text in sources_texts.items():
+        if not text:
+            continue
+        src_summaries.append(f"=== {fname} ===\n{text[:2500]}")
+    sources_excerpt = "\n\n".join(src_summaries)[:60000]
+    if not sources_excerpt:
+        return None
+
+    system_prompt = """Ты сверяешь наименование юридического лица (заявителя СМК) между двумя источниками.
+
+ЗАДАЧА:
+1) Из БЛОКА 2 (текст «Плана аудита») извлеки полное наименование организации-заявителя.
+2) Из БЛОКА 3 (тексты файлов-источников: Заявка, Договор, Приказ и т.п.) извлеки полное наименование заявителя.
+3) Сравни их по существу.
+
+ПРАВИЛА СРАВНЕНИЯ:
+- «ООО "Ромашка"» ≡ «Общество с ограниченной ответственностью "Ромашка"» — это одно и то же. match=true.
+- Разная ОПФ (ООО vs АО vs ИП) — match=false.
+- Опечатка в названии (хотя бы одна лишняя/пропущенная/изменённая буква в значимой части) — match=false.
+- Разные кавычки/регистр/пробелы — НЕ считаются расхождением.
+- Если в одном из блоков наименование не найдено — match=null, в note напиши какой источник пуст.
+
+Верни ТОЛЬКО JSON:
+{
+  "plan_name": "наименование как в Плане (или 'не найдено')",
+  "sources_name": "наименование как в источниках (или 'не найдено')",
+  "match": true | false | null,
+  "note": "если match=false — короткое описание расхождения (что именно отличается); если match=true или null — пустая строка"
+}"""
+
+    user_prompt = f"""БЛОК 2 — ПЛАН АУДИТА:
+{plan_excerpt}
+
+=====
+
+БЛОК 3 — ИСТОЧНИКИ:
+{sources_excerpt}"""
+
+    try:
+        response = _gigachat_call(api_key, system_prompt, user_prompt, model=model, max_tokens=400)
+        result = _parse_json_response(response)
+        if not isinstance(result, dict):
+            return None
+        return {
+            "plan_name": str(result.get("plan_name") or "").strip(),
+            "sources_name": str(result.get("sources_name") or "").strip(),
+            "match": result.get("match"),
+            "note": str(result.get("note") or "").strip(),
+        }
+    except Exception as e:
+        print(f"[applicant-crosscheck] Ошибка: {e}")
+        return None
+
+
 def classify_files_for_item(api_key: str, item: dict, ii_references: dict,
                              file_names: list, model: str = "GigaChat") -> list:
     """
@@ -2338,7 +2405,30 @@ async def process_documents(
         "detail": "",
     })
     validation = await validate_result(output_ref)
-    
+
+    # Доп. сверка: наименование юр.лица между блоком 2 (План) и блоком 3 (источники).
+    # Расхождение оформляем как примечание (не как issue), чтобы не валить общий статус.
+    try:
+        applicant_check = await asyncio.to_thread(
+            cross_check_applicant_name, api_key, plan_doc_text, all_texts, active_model
+        )
+    except Exception as e:
+        print(f"WARN: cross-check заявителя не выполнен: {e}")
+        applicant_check = None
+    if applicant_check and applicant_check.get("match") is False:
+        note = (
+            f"Наименование заявителя в Плане и в источниках различается. "
+            f"План (блок 2): «{applicant_check.get('plan_name') or '—'}». "
+            f"Источники (блок 3): «{applicant_check.get('sources_name') or '—'}»."
+        )
+        extra = applicant_check.get("note")
+        if extra:
+            note += f" {extra}"
+        notes = list(validation.get("notes") or [])
+        notes.append(note)
+        validation["notes"] = notes
+        validation["applicant_check"] = applicant_check
+
     # Если есть критические проблемы — пробуем исправить
     if not validation.get("valid"):
         print(f"Валидация: обнаружены проблемы {validation.get('issues')}")
