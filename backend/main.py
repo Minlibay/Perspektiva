@@ -887,6 +887,43 @@ def _parse_json_response(text: str) -> dict:
         raise ValueError(f"JSON не парсится ({e}). Ответ модели: {blob[:400]}") from e
 
 
+def _find_plan_applicant(plan_text: str) -> str:
+    """Достать первое появление 'ОПФ «Название»' в начале Плана.
+    Возвращает строку как есть, включая ОПФ-опечатки (ПААО, ОООО, АОО) — НЕ нормализуем.
+    """
+    if not plan_text:
+        return ""
+    head = plan_text[:15000]
+    # ОПФ: 2-6 заглавных русских букв подряд + пробел + название в кавычках.
+    # Покрывает и валидные (ПАО, ООО, АО, ЗАО, ОАО, НАО, ИП), и опечатки (ПААО, ОООО).
+    m = re.search(r'\b([А-ЯЁ]{2,6})\s+[«"]([^»"\n]{2,80})[»"]', head)
+    if m:
+        return f'{m.group(1)} «{m.group(2)}»'
+    return ""
+
+
+def _find_plan_audit_dates(plan_text: str) -> str:
+    """Достать строку дат после 'Сроки проведения аудита' из Плана."""
+    if not plan_text:
+        return ""
+    # Ищем в первых 30k — обычно шапка/таблица идут в начале.
+    head = plan_text[:30000]
+    idx = head.lower().find("сроки проведения")
+    if idx < 0:
+        return ""
+    window = head[idx:idx + 600]
+    # Диапазон вида "17-20.02.2026г." опционально с "г." и несколькими через запятую.
+    pattern = r'(\d{1,2}[-–]\d{1,2}\.\d{1,2}\.\d{4}\s*г?\.?(?:\s*,\s*\d{1,2}[-–]\d{1,2}\.\d{1,2}\.\d{4}\s*г?\.?)*)'
+    m = re.search(pattern, window)
+    if m:
+        return m.group(1).strip()
+    # Запасной вариант: одиночная дата ДД.ММ.ГГГГ-ДД.ММ.ГГГГ
+    m2 = re.search(r'(\d{1,2}\.\d{1,2}\.\d{4}\s*[-–]\s*\d{1,2}\.\d{1,2}\.\d{4})', window)
+    if m2:
+        return m2.group(1).strip()
+    return ""
+
+
 def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") -> dict:
     """Извлечь данные шапки (Заявитель, Вид аудита, Даты, РЭГ) из пакета документов."""
     # Бюджет на файл: Плану даём больше, потому что в начале повторяется
@@ -916,7 +953,35 @@ def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") 
 
     user_prompt = f"Документы:\n\n{combined}"
     response = _gigachat_call(api_key, system_prompt, user_prompt, model=model, max_tokens=800)
-    return _parse_json_response(response)
+    try:
+        result = _parse_json_response(response)
+    except Exception as e:
+        print(f"[header] LLM JSON-парс не удался: {e}")
+        result = {}
+
+    # Детерминированные оверрайды из Плана: модель часто нормализует ОПФ
+    # (ПААО→ПАО) и пропускает поле дат — оба заменяем сырыми значениями из текста Плана.
+    plan_text = ""
+    for fname, text in all_texts.items():
+        if "план" in fname.lower():
+            plan_text = text or ""
+            break
+    if plan_text:
+        det_applicant = _find_plan_applicant(plan_text)
+        if det_applicant:
+            result["Наименование Заявителя"] = det_applicant
+        det_dates = _find_plan_audit_dates(plan_text)
+        cur_dates = (result.get("Даты проведения") or "").strip().lower()
+        if det_dates and (not cur_dates or cur_dates in ("не найдено", "—", "-")):
+            result["Даты проведения"] = det_dates
+        print(f"[header] детерминированно: applicant='{det_applicant}', dates='{det_dates}'")
+
+    # Дефолты если ничего не нашли
+    for key in ("Наименование Заявителя", "Вид аудита", "Даты проведения", "РЭГ"):
+        if not (result.get(key) or "").strip():
+            result[key] = "не найдено"
+
+    return result
 
 
 _OPF_EXPANSIONS = [
@@ -1022,6 +1087,11 @@ def cross_check_applicant_name(api_key: str, plan_text: str, sources_texts: dict
             return None
         plan_name = str(result.get("plan_name") or "").strip()
         sources_name = str(result.get("sources_name") or "").strip()
+
+        # Plan name берём детерминированно из самого текста Плана — модель часто нормализует ОПФ.
+        det_plan = _find_plan_applicant(plan_text)
+        if det_plan:
+            plan_name = det_plan
 
         not_found = {"не найдено", "не указано", "отсутствует", ""}
         plan_missing = plan_name.lower() in not_found
@@ -1822,11 +1892,15 @@ ITEM_RULES = {
     11: {
         "file_keywords": ["план"],
         "extra_instructions": (
-            "В шаблоне Плана проверь наличие совещаний:\n"
-            "- \"Рабочее совещание\" и \"Промежуточное совещание\" в КОНЦЕ КАЖДОГО ДНЯ;\n"
-            "- \"Предварительное совещание\" в НАЧАЛЕ КАЖДОГО ДНЯ на новой площадке (новый адрес);\n"
-            "- \"Заключительное совещание\" в КОНЦЕ ПОСЛЕДНЕГО ДНЯ.\n"
-            "NOK если хотя бы одно требуемое совещание не запланировано."
+            "В шаблоне Плана проверь наличие совещаний. Минимальные требования:\n"
+            "- «Предварительное совещание» — в НАЧАЛЕ первого дня на КАЖДОЙ уникальной площадке (новом адресе).\n"
+            "- «Заключительное совещание» — в КОНЦЕ последнего дня на КАЖДОЙ уникальной площадке (для последней площадки это конец всего аудита).\n"
+            "- В конце прочих дней (не последних) — должно быть «Рабочее совещание» И/ИЛИ «Промежуточное совещание». "
+            "Достаточно хотя бы одного из этих двух; одновременно их наличие НЕ обязательно.\n"
+            "- В дни с «Заключительным совещанием» отдельные «Промежуточное»/«Рабочее» НЕ требуются — Заключительное их заменяет.\n\n"
+            "OK если для каждой площадки есть Предварительное и Заключительное, и для остальных дней — хотя бы одно из Рабочее/Промежуточное. "
+            "NOK только если отсутствует Предварительное на площадке, или Заключительное на последнем дне площадки, или если в обычный день не запланировано НИ одного совещания.\n"
+            "В reason укажи: перечень площадок и какие совещания на каких днях найдены."
         ),
     },
     12: {
