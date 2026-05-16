@@ -2216,22 +2216,27 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                     break
 
             # Пункт 4 (idx=3): вид аудита — в Плане обязана стоять галочка (☑/☒).
-            # Считаем напрямую в plan_raw, в секции «ОТМЕТКИ ... В ДОКУМЕНТЕ».
+            # Считаем напрямую в plan_raw. Если есть секция «ОТМЕТКИ» — берём её,
+            # иначе сканируем весь текст Плана (на случай если docx-парсер не выделил секцию).
             if idx == 3 and plan_raw:
                 otmetki_idx = plan_raw.find("ОТМЕТКИ")
                 if otmetki_idx >= 0:
                     block = plan_raw[otmetki_idx:otmetki_idx + 10000]
-                    checked = block.count('☑') + block.count('☒')
-                    unchecked = block.count('☐')
-                    print(f"[item 4 checkbox] checked={checked}, unchecked={unchecked}")
-                    if unchecked > 0 and checked == 0:
-                        verdict["ok"] = False
-                        verdict["nok"] = True
-                        verdict["reason"] = (
-                            f"[авто-NOK: в Плане в секции «ОТМЕТКИ» ни одного отмеченного чекбокса "
-                            f"(☐×{unchecked}, ☑/☒×0). Вид аудита обязан быть выбран галочкой — "
-                            f"если модель сказала иначе, это ошибка распознавания.]"
-                        )
+                    src = "секция ОТМЕТКИ"
+                else:
+                    block = plan_raw
+                    src = "весь Плана"
+                checked = block.count('☑') + block.count('☒')
+                unchecked = block.count('☐')
+                print(f"[item 4 checkbox] source={src}, checked={checked}, unchecked={unchecked}")
+                if unchecked > 0 and checked == 0:
+                    verdict["ok"] = False
+                    verdict["nok"] = True
+                    verdict["reason"] = (
+                        f"[авто-NOK: в Плане {src}: ни одного отмеченного чекбокса "
+                        f"(☐×{unchecked}, ☑/☒×0). Вид аудита обязан быть выбран галочкой — "
+                        f"если модель сказала иначе, это ошибка распознавания.]"
+                    )
 
             # Пункт 11 (idx=10): исключения из СТО. Только п. 7.1.3.5 (1 абзац) и
             # п. 7.1.4.3 (1 абзац) легитимны. Любой другой → NOK.
@@ -2240,8 +2245,11 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                 excl_idx = plan_raw.find("Исключения из требований")
                 if excl_idx >= 0:
                     block = plan_raw[excl_idx:excl_idx + 2000]
-                    # Все встречающиеся пункты вида 7.1.3.5, 8.3.5.4 и т.п.
-                    found_pts = re.findall(r'\b(\d+(?:\.\d+){2,4})\b', block)
+                    # Пункты СТО вида 7.1.3.5 — сегменты 1-2 цифры; это исключает даты
+                    # вида 17.03.2026 (последний сегмент 4 цифры) и любые номера с годом.
+                    raw_pts = re.findall(r'\b(\d{1,2}(?:\.\d{1,2}){2,4})\b', block)
+                    # Дедуп с сохранением порядка
+                    found_pts = list(dict.fromkeys(raw_pts))
                     # Допустимы только 7.1.3.5 и 7.1.4.3, и только если рядом есть "абзац"
                     illegitimate: list[str] = []
                     for p in found_pts:
@@ -2274,9 +2282,10 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
             # Пункт 15 (idx=14): для каждой строки с «Процесс» в Плане должны быть
             # пункты 4.4.1, 4.4.2, 4.4.3.
             if idx == 14 and plan_raw:
-                # Берём строки, содержащие "Процесс П" — обычно так маркируются процессы
+                # Окно после «Процесс П<цифра>» — допускаем переносы строк,
+                # т.к. в извлечённом docx ячейки таблицы могут разделяться \n.
                 process_rows = re.findall(
-                    r'(Процесс\s+П\d[^\n]{0,500})', plan_raw
+                    r'(Процесс\s+П\d[\s\S]{0,500})', plan_raw
                 )
                 if process_rows:
                     missing = []
