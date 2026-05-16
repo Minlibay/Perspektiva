@@ -2206,21 +2206,24 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                                                comparison=comparison_flag,
                                                compare_fields=compare_fields)
 
-            # Детерминированные пост-проверки по конкретным пунктам.
+            # Детерминированные пост-проверки идут по чистому тексту Плана
+            # (а не по evidence — там template_block обрезан до 30k и ОТМЕТКИ могут
+            # выпасть).
+            plan_raw = ""
+            for fn, txt in all_texts.items():
+                if "план" in fn.lower() and txt:
+                    plan_raw = txt
+                    break
+
             # Пункт 4 (idx=3): вид аудита — в Плане обязана стоять галочка (☑/☒).
-            # Считаем ТОЛЬКО в секции «ОТМЕТКИ» Плана, чтобы не зацепить ✓/✗ из расписания
-            # или из OCR Приказа, и не считать обычные «галочки» (✓/✗) — только настоящие
-            # боксы ☑/☒.
-            if idx == 3 and evidence:
-                otmetki_re = re.compile(
-                    r"===[^=]*ОТМЕТК[ИИ][^=]*===([\s\S]*?)(?:===|\Z)",
-                    re.IGNORECASE
-                )
-                otmetki_match = otmetki_re.search(evidence)
-                if otmetki_match:
-                    block = otmetki_match.group(1)
+            # Считаем напрямую в plan_raw, в секции «ОТМЕТКИ ... В ДОКУМЕНТЕ».
+            if idx == 3 and plan_raw:
+                otmetki_idx = plan_raw.find("ОТМЕТКИ")
+                if otmetki_idx >= 0:
+                    block = plan_raw[otmetki_idx:otmetki_idx + 10000]
                     checked = block.count('☑') + block.count('☒')
                     unchecked = block.count('☐')
+                    print(f"[item 4 checkbox] checked={checked}, unchecked={unchecked}")
                     if unchecked > 0 and checked == 0:
                         verdict["ok"] = False
                         verdict["nok"] = True
@@ -2228,6 +2231,75 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                             f"[авто-NOK: в Плане в секции «ОТМЕТКИ» ни одного отмеченного чекбокса "
                             f"(☐×{unchecked}, ☑/☒×0). Вид аудита обязан быть выбран галочкой — "
                             f"если модель сказала иначе, это ошибка распознавания.]"
+                        )
+
+            # Пункт 11 (idx=10): исключения из СТО. Только п. 7.1.3.5 (1 абзац) и
+            # п. 7.1.4.3 (1 абзац) легитимны. Любой другой → NOK.
+            if idx == 10 and plan_raw:
+                # Находим раздел «8 Исключения из требований стандартов» и берём ~2000 символов
+                excl_idx = plan_raw.find("Исключения из требований")
+                if excl_idx >= 0:
+                    block = plan_raw[excl_idx:excl_idx + 2000]
+                    # Все встречающиеся пункты вида 7.1.3.5, 8.3.5.4 и т.п.
+                    found_pts = re.findall(r'\b(\d+(?:\.\d+){2,4})\b', block)
+                    # Допустимы только 7.1.3.5 и 7.1.4.3, и только если рядом есть "абзац"
+                    illegitimate: list[str] = []
+                    for p in found_pts:
+                        is_allowed = p in ("7.1.3.5", "7.1.4.3")
+                        if not is_allowed:
+                            illegitimate.append(p)
+                            continue
+                        # Проверим, есть ли «абзац» в окрестности этого пункта
+                        p_pos = block.find(p)
+                        ctx = block[max(0, p_pos - 30):p_pos + 80].lower()
+                        if "абзац" not in ctx:
+                            illegitimate.append(f"{p} (исключён целиком, без пометки про 1 абзац)")
+                    print(f"[item 11 exclusions] all={found_pts}, illegitimate={illegitimate}")
+                    if illegitimate:
+                        verdict["ok"] = False
+                        verdict["nok"] = True
+                        verdict["reason"] = (
+                            f"[авто-NOK: нелегитимные исключения из СТО: {', '.join(illegitimate)}. "
+                            f"Допустимы только п. 7.1.3.5 и п. 7.1.4.3, и только с пометкой «1 абзац».]"
+                        )
+                    elif found_pts and not verdict.get("ok"):
+                        # Только допустимые исключения, но модель сказала NOK — переворачиваем
+                        verdict["ok"] = True
+                        verdict["nok"] = False
+                        verdict["reason"] = (
+                            f"[авто-OK: исключения в Плане — {', '.join(found_pts)}, все легитимны "
+                            f"(7.1.3.5/7.1.4.3 с пометкой «1 абзац»).]"
+                        )
+
+            # Пункт 15 (idx=14): для каждой строки с «Процесс» в Плане должны быть
+            # пункты 4.4.1, 4.4.2, 4.4.3.
+            if idx == 14 and plan_raw:
+                # Берём строки, содержащие "Процесс П" — обычно так маркируются процессы
+                process_rows = re.findall(
+                    r'(Процесс\s+П\d[^\n]{0,500})', plan_raw
+                )
+                if process_rows:
+                    missing = []
+                    for row in process_rows:
+                        # Достаточно проверить наличие всех трёх номеров в окне 500 символов
+                        if not all(p in row for p in ("4.4.1", "4.4.2", "4.4.3")):
+                            missing.append(row[:60])
+                    print(f"[item 15 processes] rows={len(process_rows)}, missing_clauses={len(missing)}")
+                    if not missing:
+                        verdict["ok"] = True
+                        verdict["nok"] = False
+                        if "[авто-OK" not in (verdict.get("reason") or ""):
+                            verdict["reason"] = (
+                                f"[авто-OK: найдено {len(process_rows)} строк с «Процесс», "
+                                f"в каждой присутствуют пункты 4.4.1, 4.4.2, 4.4.3.] "
+                                + (verdict.get("reason") or "")
+                            )
+                    elif missing and verdict.get("ok"):
+                        verdict["ok"] = False
+                        verdict["nok"] = True
+                        verdict["reason"] = (
+                            f"[авто-NOK: в {len(missing)} из {len(process_rows)} строк с «Процесс» "
+                            f"отсутствует хотя бы один из 4.4.1/4.4.2/4.4.3.]"
                         )
 
             # Пункт 12 (idx=11): совещания. Модель часто цепляется за маркеры ИИ13/ИИ9
