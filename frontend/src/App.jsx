@@ -407,7 +407,7 @@ function App() {
 
   const processDocuments = async () => {
     if (!apiKey) {
-      setError('Введите API ключ GigaChat')
+      setError('API ключ GigaChat не сохранён. Откройте «🔧 Админ» и сохраните ключ.')
       return
     }
     if (!uploadedFiles.plan) {
@@ -493,6 +493,107 @@ function App() {
 
       {showAdmin && (
         <Card className="mb-4">
+          <Card.Header className="bg-primary text-white">
+            🔑 Настройки GigaChat API
+          </Card.Header>
+          <Card.Body>
+            <Row className="g-2 align-items-center">
+              <Col md={5}>
+                <Form.Label className="small text-muted mb-1">API ключ</Form.Label>
+                <Form.Control
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => { setApiKey(e.target.value); setApiKeySaved(false); setSaveSuccess(false) }}
+                  placeholder="Введите ваш API ключ GigaChat"
+                />
+              </Col>
+              <Col md={3}>
+                <Form.Label className="small text-muted mb-1">
+                  Модель {defaultModel && <span className="text-muted">(по умолч. {defaultModel})</span>}
+                </Form.Label>
+                <Form.Select
+                  value={model || defaultModel || ''}
+                  onChange={(e) => { setModel(e.target.value); setApiKeySaved(false); setSaveSuccess(false) }}
+                >
+                  {availableModels.map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </Form.Select>
+              </Col>
+              <Col md={2}>
+                <Form.Label className="small text-muted mb-1">&nbsp;</Form.Label>
+                <Button
+                  className="w-100"
+                  variant={apiKeySaved ? 'outline-primary' : 'primary'}
+                  onClick={saveApiKey}
+                  disabled={!apiKey || !apiKey.trim()}
+                >
+                  {apiKeySaved ? '↻ Сохранить' : 'Сохранить'}
+                </Button>
+              </Col>
+              <Col md={2}>
+                <Form.Label className="small text-muted mb-1">&nbsp;</Form.Label>
+                <Button
+                  className="w-100"
+                  variant="outline-secondary"
+                  onClick={runDiagnose}
+                  disabled={diagnosing}
+                >
+                  {diagnosing ? (
+                    <><Spinner animation="border" size="sm" className="me-2" />Проверка...</>
+                  ) : (
+                    '🔍 Диагностика'
+                  )}
+                </Button>
+              </Col>
+            </Row>
+            {saveSuccess && (
+              <Alert variant="success" className="mt-2 mb-0 py-2">
+                ✓ Ключ успешно сохранён на сервере
+              </Alert>
+            )}
+            {apiKeySaved && !saveSuccess && (
+              <div className="text-muted small mt-2">
+                Ключ уже сохранён. Можно перезаписать при необходимости.
+              </div>
+            )}
+            {diagnose && (
+              <Alert
+                variant={diagnose.ok ? 'success' : 'warning'}
+                className="mt-3 mb-0"
+              >
+                <div>
+                  <strong>Статус: </strong>
+                  {diagnose.ok ? '✓ Готов к работе' : `✗ ${diagnose.stage}`}
+                </div>
+                <div className="mt-1 small">{diagnose.detail}</div>
+                {diagnose.current_model && (
+                  <div className="mt-1 small">
+                    Выбранная модель в backend: <code>{diagnose.current_model}</code>
+                  </div>
+                )}
+                {diagnose.models && diagnose.models.length > 0 && (
+                  <div className="mt-1 small">
+                    Доступные модели на ключе:{' '}
+                    {diagnose.models.map((m) => (
+                      <Badge
+                        key={m}
+                        bg={m === diagnose.current_model ? 'primary' : 'secondary'}
+                        className="me-1"
+                      >
+                        {m}
+                      </Badge>
+                    ))}
+                  </div>
+                )}
+              </Alert>
+            )}
+          </Card.Body>
+        </Card>
+      )}
+
+      {showAdmin && (
+        <Card className="mb-4">
           <Card.Header className="bg-dark text-white d-flex justify-content-between align-items-center">
             <span>🗂 История запросов</span>
             <Button size="sm" variant="outline-light" onClick={loadAdminSessions} disabled={adminLoading}>
@@ -563,109 +664,6 @@ function App() {
       )}
 
       <Row style={{ display: showAdmin ? 'none' : undefined }}>
-        {/* Настройки GigaChat */}
-        <Col md={12} className="mb-4">
-          <Card>
-            <Card.Header className="bg-primary text-white">
-              🔑 Настройки GigaChat API
-            </Card.Header>
-            <Card.Body>
-              <Row className="g-2 align-items-center">
-                <Col md={5}>
-                  <Form.Label className="small text-muted mb-1">API ключ</Form.Label>
-                  <Form.Control
-                    type="password"
-                    value={apiKey}
-                    onChange={(e) => { setApiKey(e.target.value); setApiKeySaved(false); setSaveSuccess(false) }}
-                    placeholder="Введите ваш API ключ GigaChat"
-                  />
-                </Col>
-                <Col md={3}>
-                  <Form.Label className="small text-muted mb-1">
-                    Модель {defaultModel && <span className="text-muted">(по умолч. {defaultModel})</span>}
-                  </Form.Label>
-                  <Form.Select
-                    value={model || defaultModel || ''}
-                    onChange={(e) => { setModel(e.target.value); setApiKeySaved(false); setSaveSuccess(false) }}
-                  >
-                    {availableModels.map((m) => (
-                      <option key={m} value={m}>{m}</option>
-                    ))}
-                  </Form.Select>
-                </Col>
-                <Col md={2}>
-                  <Form.Label className="small text-muted mb-1">&nbsp;</Form.Label>
-                  <Button
-                    className="w-100"
-                    variant={apiKeySaved ? 'outline-primary' : 'primary'}
-                    onClick={saveApiKey}
-                    disabled={!apiKey || !apiKey.trim()}
-                  >
-                    {apiKeySaved ? '↻ Сохранить' : 'Сохранить'}
-                  </Button>
-                </Col>
-                <Col md={2}>
-                  <Form.Label className="small text-muted mb-1">&nbsp;</Form.Label>
-                  <Button
-                    className="w-100"
-                    variant="outline-secondary"
-                    onClick={runDiagnose}
-                    disabled={diagnosing}
-                  >
-                    {diagnosing ? (
-                      <><Spinner animation="border" size="sm" className="me-2" />Проверка...</>
-                    ) : (
-                      '🔍 Диагностика'
-                    )}
-                  </Button>
-                </Col>
-              </Row>
-              {saveSuccess && (
-                <Alert variant="success" className="mt-2 mb-0 py-2">
-                  ✓ Ключ успешно сохранён на сервере
-                </Alert>
-              )}
-              {apiKeySaved && !saveSuccess && (
-                <div className="text-muted small mt-2">
-                  Ключ уже сохранён. Можно перезаписать при необходимости.
-                </div>
-              )}
-
-              {diagnose && (
-                <Alert
-                  variant={diagnose.ok ? 'success' : 'warning'}
-                  className="mt-3 mb-0"
-                >
-                  <div>
-                    <strong>Статус: </strong>
-                    {diagnose.ok ? '✓ Готов к работе' : `✗ ${diagnose.stage}`}
-                  </div>
-                  <div className="mt-1 small">{diagnose.detail}</div>
-                  {diagnose.current_model && (
-                    <div className="mt-1 small">
-                      Выбранная модель в backend: <code>{diagnose.current_model}</code>
-                    </div>
-                  )}
-                  {diagnose.models && diagnose.models.length > 0 && (
-                    <div className="mt-1 small">
-                      Доступные модели на ключе:{' '}
-                      {diagnose.models.map((m) => (
-                        <Badge
-                          key={m}
-                          bg={m === diagnose.current_model ? 'primary' : 'secondary'}
-                          className="me-1"
-                        >
-                          {m}
-                        </Badge>
-                      ))}
-                    </div>
-                  )}
-                </Alert>
-              )}
-            </Card.Body>
-          </Card>
-        </Col>
-
         {/* Загрузка файлов - 2 блока: План + Источники */}
         <Col md={4}>
           <Card className="mb-4 h-100">
