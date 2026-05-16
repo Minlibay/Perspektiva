@@ -888,17 +888,24 @@ def _parse_json_response(text: str) -> dict:
 
 
 def _find_plan_applicant(plan_text: str) -> str:
-    """Достать первое появление 'ОПФ «Название»' в начале Плана.
+    """Достать первое появление 'ОПФ «Название»' в начале Плана, исключив орган по сертификации.
+
     Возвращает строку как есть, включая ОПФ-опечатки (ПААО, ОООО, АОО) — НЕ нормализуем.
+    Орган по сертификации в шаблонах Газпрома — это «ОС СМК ООО «КЦ «Перспектива»»,
+    он обычно идёт первым в колонтитуле. Заявитель — следующий.
     """
     if not plan_text:
         return ""
     head = plan_text[:15000]
+    # Названия, которые НЕ являются заявителем (это орган по сертификации или служебные).
+    blacklist_substrings = ("кц", "перспектива", "ос смк", "орган по сертифик", "интергазсерт")
     # ОПФ: 2-6 заглавных русских букв подряд + пробел + название в кавычках.
-    # Покрывает и валидные (ПАО, ООО, АО, ЗАО, ОАО, НАО, ИП), и опечатки (ПААО, ОООО).
-    m = re.search(r'\b([А-ЯЁ]{2,6})\s+[«"]([^»"\n]{2,80})[»"]', head)
-    if m:
-        return f'{m.group(1)} «{m.group(2)}»'
+    for m in re.finditer(r'\b([А-ЯЁ]{2,6})\s+[«"]([^»"\n]{2,80})[»"]', head):
+        candidate = f'{m.group(1)} «{m.group(2)}»'
+        low = candidate.lower()
+        if any(b in low for b in blacklist_substrings):
+            continue
+        return candidate
     return ""
 
 
@@ -2086,6 +2093,29 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                     verdict["reason"] = (
                         f"[авто-NOK: в Плане в блоке '1 Цель и область аудита' ВСЕ чекбоксы "
                         f"не отмечены (☐×{unchecked}, отмеченных ☑/☒×0). Вид аудита обязан быть выбран галочкой.] "
+                        + (verdict.get("reason") or "")
+                    )
+
+            # Пункт 12 (idx=11): совещания. Модель часто цепляется за маркеры ИИ13/ИИ9
+            # из problems_hint и заявляет «отсутствует», даже когда в Плане совещания есть.
+            # Считаем явные вхождения и переопределяем при достаточном покрытии.
+            if idx == 11 and not verdict.get("ok") and evidence:
+                ev_lc = evidence.lower()
+                preliminary = ev_lc.count("предварительное совещан")
+                final_meet = ev_lc.count("заключительное совещан")
+                intermediate = ev_lc.count("промежуточное совещан") + ev_lc.count("рабочее совещан")
+                reason_lc = (verdict.get("reason") or "").lower()
+                deny_signals = ("отсутств", "не подтвержд", "не найден", "не запланирован", "не обнаруж")
+                model_denied = any(s in reason_lc for s in deny_signals)
+                # Базовая проверка: есть хотя бы одно Предварительное, одно Заключительное
+                # и какие-то Рабочие/Промежуточные. Этого минимума достаточно.
+                if model_denied and preliminary >= 1 and final_meet >= 1 and intermediate >= 1:
+                    verdict["ok"] = True
+                    verdict["nok"] = False
+                    verdict["reason"] = (
+                        f"[авто-OK: в Плане найдены Предварительные совещания ({preliminary}), "
+                        f"Заключительные ({final_meet}), Рабочие/Промежуточные ({intermediate}) — "
+                        f"минимальные требования выполнены] "
                         + (verdict.get("reason") or "")
                     )
 
