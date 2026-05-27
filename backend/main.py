@@ -1116,6 +1116,43 @@ def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") 
         result["Вид аудита"] = det_audit_type
         print(f"[header] детерминированно: audit_type='{det_audit_type}'")
 
+    # РЭГ — формат «ОГН<цифра>.RU.<номер> (<суффикс>)». Берём из Приказа ЭГ,
+    # фолбэк — любой другой файл (кроме Расчёта трудоёмкости, где встречается
+    # «ОГН0.RU.0125 Порядок оплат» — это код регламента, не РЭГ).
+    cur_reg = (result.get("РЭГ") or "").strip().lower()
+    if not cur_reg or cur_reg in ("не найдено", "—", "-"):
+        reg_re = re.compile(
+            r"(ОГН\d*\s*\.\s*RU\s*\.\s*\d{2,6})(\s*\([^)]{1,40}\))?",
+            re.IGNORECASE,
+        )
+        det_reg = None
+        # 1) Приоритет — файлы с «приказ» или «эг» в имени.
+        for fname, text in all_texts.items():
+            fn_lc = fname.lower()
+            if "трудоемкост" in fn_lc or "трудоёмкост" in fn_lc:
+                continue
+            if "приказ" in fn_lc or " эг" in f" {fn_lc} " or "_эг" in fn_lc:
+                m = reg_re.search(text or "")
+                if m:
+                    det_reg = (m.group(1) + (m.group(2) or "")).strip()
+                    break
+        # 2) Фолбэк — остальные файлы (всё ещё пропуская Расчёт).
+        if not det_reg:
+            for fname, text in all_texts.items():
+                fn_lc = fname.lower()
+                if "трудоемкост" in fn_lc or "трудоёмкост" in fn_lc:
+                    continue
+                m = reg_re.search(text or "")
+                if m:
+                    det_reg = (m.group(1) + (m.group(2) or "")).strip()
+                    break
+        if det_reg:
+            # Нормализуем пробелы внутри «ОГН0 . RU . 0136» → «ОГН0.RU.0136».
+            det_reg = re.sub(r"\s*\.\s*", ".", det_reg)
+            det_reg = re.sub(r"\s+", " ", det_reg).strip()
+            result["РЭГ"] = det_reg
+            print(f"[header] детерминированно: РЭГ='{det_reg}'")
+
     # Дефолты если ничего не нашли
     for key in ("Наименование Заявителя", "Вид аудита", "Даты проведения", "РЭГ"):
         if not (result.get(key) or "").strip():
