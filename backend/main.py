@@ -1710,9 +1710,19 @@ ok и nok — взаимоисключающие: ровно один true, др
                 if not isinstance(row, dict):
                     continue
                 # 1) Проверка на галлюцинации: каждая непустая цитата должна быть в evidence.
+                # Кроме «технических» меток модели о том, что данные в файле отсутствуют —
+                # это служебные фразы, а не цитаты, и их в evidence искать бессмысленно.
+                _ABSENCE_MARKERS = (
+                    "не найдено", "не указано", "не указан", "не указаны",
+                    "отсутств", "не содержит", "нет данных", "нет в файле",
+                    "не приведен", "не приведено", "не приведены",
+                )
                 for key in ("value_in_plan", "value_in_other"):
                     raw = (row.get(key) or "").strip()
-                    if not raw or raw.lower() in ("не найдено", "—", "-", "n/a", "нет"):
+                    raw_lc = raw.lower()
+                    if not raw or raw_lc in ("не найдено", "—", "-", "n/a", "нет"):
+                        continue
+                    if any(m in raw_lc for m in _ABSENCE_MARKERS):
                         continue
                     if _norm(raw) and _norm(raw) not in evidence_norm:
                         hallucinations.append(
