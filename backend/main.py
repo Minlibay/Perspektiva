@@ -3002,6 +3002,120 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
 
             # Пункт 15 (idx=14): для каждой строки с «Процесс» в Плане должны быть
             # пункты 4.4.1, 4.4.2, 4.4.3.
+            # Пункт 10 (idx=9, замечания/несоответствия предыдущего аудита):
+            # детерминированная сверка АКТа и Плана.
+            #   В Акте парсим п.24 «Количество значительных/малозначительных
+            #   несоответствий» и общие фразы об отсутствии замечаний.
+            #   В Плане ищем раздел «Замечания/несоответствия по результатам
+            #   предыдущего аудита» (по тексту, не по номеру — в разных редакциях
+            #   шаблона номер раздела может отличаться).
+            if idx == 9:
+                akt_files = [f for f in relevant if "акт" in f.lower()]
+                akt_text = "\n".join(all_texts.get(f, "") for f in akt_files)
+
+                def _count_nc(text: str, kind: str) -> int:
+                    pat = re.compile(
+                        r"Количество\s+" + kind + r"\s+несоответствий"
+                        r"(?!\s*,\s*устран)\s*([0-9]+|\s*\|)",
+                        re.IGNORECASE,
+                    )
+                    total = 0
+                    for m in pat.finditer(text):
+                        v = m.group(1).strip()
+                        if v and v != "|":
+                            try:
+                                total += int(v)
+                            except ValueError:
+                                pass
+                    return total
+
+                if not akt_text:
+                    verdict["ok"] = False
+                    verdict["nok"] = True
+                    verdict["reason"] = (
+                        "Файл «Акт предыдущего аудита» не загружен — сверить замечания не с чем."
+                    )
+                else:
+                    sig = _count_nc(akt_text, "значительных")
+                    minor = _count_nc(akt_text, "малозначительных")
+                    akt_lc = akt_text.lower()
+                    explicit_clean = any(
+                        ph in akt_lc
+                        for ph in (
+                            "несоответствий не выявлен",
+                            "замечаний не выявлен",
+                            "замечания не выявлен",
+                            "без замечаний",
+                            "несоответствия не выявлен",
+                        )
+                    )
+                    plan_lc = (plan_raw or "").lower()
+                    has_plan_section = bool(
+                        re.search(
+                            r"замечани[яе]\s*[\\/]?\s*несоответстви",
+                            plan_lc,
+                        )
+                        or re.search(
+                            r"замечани[яе]\s+.{0,60}предыдущ",
+                            plan_lc,
+                        )
+                        or re.search(
+                            r"несоответстви[яе]\s+.{0,60}предыдущ",
+                            plan_lc,
+                        )
+                    )
+
+                    total_nc = sig + minor
+                    akt_file_label = akt_files[0] if akt_files else "Акт"
+
+                    if total_nc == 0 and explicit_clean:
+                        verdict["ok"] = True
+                        verdict["nok"] = False
+                        verdict["reason"] = (
+                            f"В Акте предыдущего аудита («{akt_file_label}») замечаний/"
+                            f"несоответствий не выявлено — раздел в Плане не требуется."
+                        )
+                    elif total_nc == 0 and not explicit_clean:
+                        # Чисел нет, но и явной формулировки «не выявлено» тоже.
+                        # Считаем OK, но в reason указываем, что проверка по факту прошла мягко.
+                        verdict["ok"] = True
+                        verdict["nok"] = False
+                        verdict["reason"] = (
+                            f"В Акте предыдущего аудита («{akt_file_label}») числовых "
+                            f"показателей несоответствий не обнаружено и явных упоминаний "
+                            f"замечаний нет — отмечено как OK."
+                        )
+                    else:
+                        # В Акте есть несоответствия — проверяем, отражены ли они в Плане.
+                        parts = []
+                        if sig:
+                            parts.append(f"значительных: {sig}")
+                        if minor:
+                            parts.append(f"малозначительных: {minor}")
+                        counts_str = ", ".join(parts)
+                        if has_plan_section:
+                            verdict["ok"] = True
+                            verdict["nok"] = False
+                            verdict["reason"] = (
+                                f"В Акте предыдущего аудита («{akt_file_label}») выявлено "
+                                f"{counts_str} несоответствий; в Плане раздел про замечания/"
+                                f"несоответствия предыдущего аудита присутствует."
+                            )
+                        else:
+                            verdict["ok"] = False
+                            verdict["nok"] = True
+                            verdict["reason"] = (
+                                f"В Акте предыдущего аудита («{akt_file_label}») выявлено "
+                                f"{counts_str} несоответствий, но в Плане раздел про "
+                                f"замечания/несоответствия предыдущего аудита отсутствует — "
+                                f"нечем подтвердить, что они учтены/закрыты."
+                            )
+                print(
+                    f"[item 10 nc] sig={ _count_nc(akt_text, 'значительных') if akt_text else '-'} "
+                    f"minor={ _count_nc(akt_text, 'малозначительных') if akt_text else '-'} "
+                    f"-> {'OK' if verdict.get('ok') else 'NOK'}"
+                )
+
             if idx == 14 and plan_raw:
                 # Окно после «Процесс П<цифра>» — допускаем переносы строк,
                 # т.к. в извлечённом docx ячейки таблицы могут разделяться \n.
