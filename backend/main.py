@@ -2590,6 +2590,98 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                     plan_raw = txt
                     break
 
+            # Пункт 1 (idx=0): дата утверждения Плана vs дата начала аудита.
+            # Считаем сами — модель регулярно либо галлюцинирует даты, либо
+            # пишет «не позднее пяти рабочих дней» словами, и старый
+            # пост-чек на цифры в reason такие случаи пропускает.
+            if idx == 0 and plan_raw:
+                _MONTHS_RU = {
+                    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
+                    "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+                }
+
+                def _month_num(word: str):
+                    w = (word or "").lower().replace("ё", "е")
+                    for stem, n in _MONTHS_RU.items():
+                        if w.startswith(stem):
+                            return n
+                    return None
+
+                d_utv = None
+                # «01» декабря 2025 г.  /  « 01 » декабря 20 25 г.
+                m = re.search(
+                    r"«\s*(\d{1,2})\s*»\s*([А-Яа-яё]+)\s*20\s*(\d{2})\s*г",
+                    plan_raw,
+                )
+                if m:
+                    mon = _month_num(m.group(2))
+                    if mon:
+                        d_utv = (int(m.group(1)), mon, 2000 + int(m.group(3)))
+
+                d_start = None
+                # «5 Сроки проведения аудита 09-11.12.2025г.» — диапазон.
+                # Сначала пытаемся распознать диапазон DD-DD.MM.YYYY (берём первую дату),
+                # затем — одиночную дату DD.MM.YYYY.
+                i_srok = plan_raw.find("Сроки проведения")
+                if i_srok >= 0:
+                    seg = plan_raw[i_srok : i_srok + 400]
+                    md = re.search(r"(\d{1,2})\s*[-–]\s*\d{1,2}\.(\d{1,2})\.(\d{2,4})", seg)
+                    if not md:
+                        md = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", seg)
+                    if md:
+                        d, mo, y = int(md.group(1)), int(md.group(2)), int(md.group(3))
+                        if y < 100:
+                            y += 2000
+                        d_start = (d, mo, y)
+
+                if d_utv and d_start:
+                    from datetime import date as _date, timedelta
+                    try:
+                        du = _date(d_utv[2], d_utv[1], d_utv[0])
+                        ds = _date(d_start[2], d_start[1], d_start[0])
+                    except ValueError:
+                        du = ds = None
+                    if du and ds:
+                        # Считаем рабочие дни от du до ds включительно (Пн–Пт).
+                        if du > ds:
+                            verdict["ok"] = False
+                            verdict["nok"] = True
+                            verdict["reason"] = (
+                                f"План утверждён ПОСЛЕ начала аудита: "
+                                f"D_утв={du.strftime('%d.%m.%Y')}, "
+                                f"D_начало={ds.strftime('%d.%m.%Y')}. Недопустимо."
+                            )
+                        else:
+                            cnt = 0
+                            cur = du
+                            while cur <= ds:
+                                if cur.weekday() < 5:
+                                    cnt += 1
+                                cur += timedelta(days=1)
+                            if cnt > 5:
+                                verdict["ok"] = False
+                                verdict["nok"] = True
+                                verdict["reason"] = (
+                                    f"План утверждён слишком рано: "
+                                    f"D_утв={du.strftime('%d.%m.%Y')}, "
+                                    f"D_начало={ds.strftime('%d.%m.%Y')}, "
+                                    f"между ними {cnt} рабочих дней (требование ≤5)."
+                                )
+                            else:
+                                verdict["ok"] = True
+                                verdict["nok"] = False
+                                verdict["reason"] = (
+                                    f"Дата утверждения Плана соответствует требованию: "
+                                    f"D_утв={du.strftime('%d.%m.%Y')}, "
+                                    f"D_начало={ds.strftime('%d.%m.%Y')}, "
+                                    f"между ними {cnt} рабочих дней (≤5)."
+                                )
+                            print(
+                                f"[item 1 deterministic] D_утв={du.isoformat()} "
+                                f"D_начало={ds.isoformat()} рабочих_дней={cnt} -> "
+                                f"{'OK' if verdict['ok'] else 'NOK'}"
+                            )
+
             # Пункт 2 (idx=1, орг.структура): детерминированная fuzzy-сверка.
             # Перебивает вердикт модели, потому что OCR орг.структуры всегда
             # шумный и LLM регулярно ошибается в обе стороны.
