@@ -2242,6 +2242,217 @@ ITEM_RULES = {
 }
 
 
+# ===== Fuzzy-сверка подразделений (для п.2 «Орг.структура») =====
+# OCR орг.структуры часто содержит шум (склейки слов, замены букв), поэтому
+# буквальное сравнение названий не работает. Используем сверку по корням слов
+# с допуском в 1 редакторскую ошибку на каждые 4 символа.
+
+_ORG_STOP_WORDS = {
+    "и", "по", "в", "для", "с", "из", "на", "от", "к", "до", "за", "над",
+    "под", "при", "о", "об", "у", "не", "также", "или", "но", "а", "их",
+    "то", "что", "как",
+}
+_ORG_GENERIC_PREFIXES = (
+    "отдел", "отделом", "управлен", "департамент", "служб",
+    "групп", "сектор", "центр", "бюро",
+)
+
+
+def _org_normalize(text: str) -> str:
+    s = (text or "").lower().replace("ё", "е")
+    s = re.sub(r"[^а-я0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _org_significant_stems(division_name: str) -> list:
+    """Возвращает «значащие» корни (по 6 символов) из названия подразделения,
+    отбрасывая стоп-слова и родовые («отдел», «управление» и т.п.)."""
+    norm = _org_normalize(division_name)
+    stems = []
+    seen = set()
+    for tok in norm.split():
+        if len(tok) < 5:
+            continue
+        if tok in _ORG_STOP_WORDS:
+            continue
+        if any(tok.startswith(g) for g in _ORG_GENERIC_PREFIXES):
+            continue
+        stem = tok[:6]
+        if stem not in seen:
+            seen.add(stem)
+            stems.append(stem)
+    return stems
+
+
+def _edit_distance(a: str, b: str, cutoff: int = 3) -> int:
+    """Усечённое расстояние Левенштейна. Возвращает cutoff+1, если превысили."""
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > cutoff:
+        return cutoff + 1
+    la, lb = len(a), len(b)
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la
+    prev = list(range(la + 1))
+    for i, cb in enumerate(b, 1):
+        curr = [i] + [0] * la
+        best = curr[0]
+        for j, ca in enumerate(a, 1):
+            curr[j] = min(
+                curr[j - 1] + 1,
+                prev[j] + 1,
+                prev[j - 1] + (0 if ca == cb else 1),
+            )
+            if curr[j] < best:
+                best = curr[j]
+        if best > cutoff:
+            return cutoff + 1
+        prev = curr
+    return prev[-1]
+
+
+def _stem_in_text(stem: str, ocr_text_norm: str, ocr_tokens: list) -> bool:
+    """Проверяет, встречается ли корень в OCR-тексте — подстрока или fuzzy."""
+    if stem in ocr_text_norm:
+        return True
+    max_dist = max(1, len(stem) // 4)
+    for tok in ocr_tokens:
+        if len(tok) < len(stem):
+            continue
+        for i in range(len(tok) - len(stem) + 1):
+            if _edit_distance(stem, tok[i : i + len(stem)], cutoff=max_dist) <= max_dist:
+                return True
+    return False
+
+
+_PLAN_DIVISION_RE = re.compile(
+    r"([А-ЯЁ][А-Яа-яЁё0-9 ,\-«»\"'()/]{8,200}?)"
+    r"\s+[–—-]\s+"
+    r"[А-ЯЁ][а-яё]+(?:ов|ев|ин|кий|ова|ева|ина|ская|ко|ян|ук|юк|ий)\s*[А-ЯЁ]\.\s*[А-ЯЁ]\."
+)
+
+
+def _extract_plan_divisions(plan_text: str) -> list:
+    """Вытаскивает подразделения из раздела 10 «Объекты аудита»:
+    строки вида '<Подразделение> – <Фамилия И.О.>'."""
+    if not plan_text:
+        return []
+    divisions = []
+    seen = set()
+    for m in _PLAN_DIVISION_RE.finditer(plan_text):
+        d = m.group(1).strip(" ,.|-")
+        if not re.search(r"(отдел|управлен|департамент|служб|групп|сектор|центр|бюро|цех)", d, re.IGNORECASE):
+            continue
+        key = _org_normalize(d)
+        if key in seen or len(key) < 10:
+            continue
+        seen.add(key)
+        divisions.append(d)
+    return divisions
+
+
+_APPLICANT_OPF_RE = re.compile(r"\b(пао|ао|ооо|зао|оао|нко|фгуп|пкф|ип)\b", re.IGNORECASE)
+
+
+def _applicant_core_name(name: str) -> str:
+    """Из «ПАО \"Газпром автоматизация\"» оставляет «газпром автоматизация» для нечёткой сверки."""
+    if not name:
+        return ""
+    s = name.lower().replace("ё", "е")
+    s = _APPLICANT_OPF_RE.sub(" ", s)
+    s = re.sub(r"[«»\"'()]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def fuzzy_orgstructure_check(plan_text: str, org_text: str, applicant_name: str = "") -> dict:
+    """Детерминированная сверка орг.структуры с Планом.
+    Возвращает {ok, reason, matched, total, missing}."""
+    if not org_text:
+        return {
+            "ok": False,
+            "reason": "Файл организационной структуры не загружен или его текст не извлёкся.",
+            "matched": 0, "total": 0, "missing": [],
+        }
+
+    org_norm = _org_normalize(org_text)
+    org_tokens = [t for t in org_norm.split() if len(t) >= 4]
+
+    # 1) Проверка названия заявителя (если оно известно).
+    if applicant_name:
+        core = _applicant_core_name(applicant_name)
+        core_tokens = [t for t in core.split() if len(t) >= 4]
+        applicant_hits = sum(1 for t in core_tokens if _stem_in_text(t[:6], org_norm, org_tokens))
+        if core_tokens and applicant_hits < max(1, len(core_tokens) // 2 + (len(core_tokens) % 2)):
+            return {
+                "ok": False,
+                "reason": (
+                    f"Название заявителя «{applicant_name}» не найдено в файле орг.структуры — "
+                    f"возможно, загружена орг.структура другой организации."
+                ),
+                "matched": 0, "total": 0, "missing": [],
+            }
+
+    # 2) Сверка подразделений.
+    divisions = _extract_plan_divisions(plan_text)
+    if not divisions:
+        return {
+            "ok": True,
+            "reason": (
+                "В Плане не удалось выделить перечень подразделений (раздел 10 «Объекты аудита» "
+                "пуст или имеет нестандартный формат). Сверка с орг.структурой пропущена; "
+                "название заявителя в орг.структуре подтверждено."
+            ),
+            "matched": 0, "total": 0, "missing": [],
+        }
+
+    matched, missing = [], []
+    for div in divisions:
+        stems = _org_significant_stems(div)
+        if not stems:
+            continue
+        need = max(1, (len(stems) + 1) // 2)
+        hits = sum(1 for s in stems if _stem_in_text(s, org_norm, org_tokens))
+        if hits >= need:
+            matched.append(div)
+        else:
+            missing.append(div)
+
+    total = len(matched) + len(missing)
+    if total == 0:
+        return {
+            "ok": True,
+            "reason": "Подразделения из Плана содержат только родовые слова — сверка пропущена.",
+            "matched": 0, "total": 0, "missing": [],
+        }
+
+    ratio = len(matched) / total
+    ok = ratio >= 0.6
+    if ok:
+        reason = (
+            f"В орг.структуре найдено {len(matched)} из {total} подразделений из Плана "
+            f"({int(ratio * 100)}%)."
+        )
+        if missing:
+            shown = missing[:3]
+            reason += f" Не нашлись: {'; '.join(shown)}"
+            if len(missing) > 3:
+                reason += f" (и ещё {len(missing) - 3})"
+            reason += " — возможно, незначимые отклонения OCR."
+    else:
+        shown = missing[:5]
+        reason = (
+            f"В орг.структуре найдено только {len(matched)} из {total} подразделений из Плана "
+            f"({int(ratio * 100)}%, порог 60%). Не нашлись: {'; '.join(shown)}"
+        )
+        if len(missing) > 5:
+            reason += f" (и ещё {len(missing) - 5})"
+        reason += "."
+    return {"ok": ok, "reason": reason, "matched": len(matched), "total": total, "missing": missing}
+
+
 def _files_by_keyword(file_names: list, keywords: list) -> list:
     """Возвращает файлы, в имени которых встречается ЛЮБАЯ из подстрок (без учёта регистра)."""
     if not keywords:
@@ -2378,6 +2589,37 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                 if "план" in fn.lower() and txt:
                     plan_raw = txt
                     break
+
+            # Пункт 2 (idx=1, орг.структура): детерминированная fuzzy-сверка.
+            # Перебивает вердикт модели, потому что OCR орг.структуры всегда
+            # шумный и LLM регулярно ошибается в обе стороны.
+            if idx == 1:
+                org_files = [
+                    f for f in relevant
+                    if any(k in f.lower() for k in (
+                        "оргструктур", "орг.структур", "орг структур",
+                        "организацион", "ос ", "ос_", "ос-", "ос.",
+                    ))
+                ]
+                if not org_files:
+                    verdict["ok"] = False
+                    verdict["nok"] = True
+                    verdict["reason"] = (
+                        "Файл организационной структуры не загружен. "
+                        "Загрузите файл с подстрокой в имени: «Орг.структура», «Организационная», «ОС…»."
+                    )
+                else:
+                    org_text = all_texts.get(org_files[0], "")
+                    applicant = (header_data or {}).get("Наименование Заявителя", "") or ""
+                    fz = fuzzy_orgstructure_check(plan_raw, org_text, applicant_name=applicant)
+                    verdict["ok"] = bool(fz["ok"])
+                    verdict["nok"] = not verdict["ok"]
+                    verdict["reason"] = fz["reason"]
+                    verdict["source_file"] = org_files[0]
+                    print(
+                        f"[item 2 fuzzy] matched={fz['matched']}/{fz['total']} "
+                        f"missing={len(fz['missing'])} -> {'OK' if fz['ok'] else 'NOK'}"
+                    )
 
             # Пункт 4 (idx=3): вид аудита — в Плане обязана стоять галочка (☑/☒).
             # Считаем напрямую в plan_raw. Если есть секция «ОТМЕТКИ» — берём её,
