@@ -248,8 +248,16 @@ def _collect_docx_part_text(part) -> list:
     for table in getattr(part, "tables", []):
         for row in table.rows:
             row_texts = [cell.text.strip() for cell in row.cells]
-            if any(row_texts):
-                out.append(" | ".join(row_texts))
+            # В docx объединённые ячейки возвращаются по одному инстансу на каждую
+            # колонку сетки — итог: '7 Состав | 7 Состав | 7 Состав | ...'.
+            # Сжимаем подряд идущие одинаковые непустые значения до одного.
+            deduped = []
+            for t in row_texts:
+                if deduped and t == deduped[-1]:
+                    continue
+                deduped.append(t)
+            if any(deduped):
+                out.append(" | ".join(deduped))
     return out
 
 
@@ -1584,6 +1592,71 @@ ok и nok — взаимоисключающие: ровно один true, др
             kw_norm = [k.lower() for k in (expected_file_keywords or []) if k]
             # Слова, по которым понимаем что other_file — это «План аудита» (его не считаем нужным источником)
             plan_markers = ("план", "plan")
+
+            # Детерминированная нормализация для пункта по договору:
+            # модель ставит match=false из-за форматных различий ('17 60-25' vs '17-60-25',
+            # '03.09.25' vs '03.09.2025'), хотя правило явно велит нормализовать.
+            is_contract_item = any("договор" in k or "соглашен" in k or "контракт" in k for k in kw_norm)
+            if is_contract_item:
+                _MONTHS_RU = {
+                    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
+                    "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+                }
+
+                def _norm_contract_num(s: str) -> str:
+                    return re.sub(r"[^0-9a-zа-я]", "", (s or "").lower().replace("ё", "е"))
+
+                def _parse_date(s: str) -> Optional[tuple]:
+                    s = (s or "").strip().lower().replace("ё", "е")
+                    if not s:
+                        return None
+                    m = re.search(r"(\d{1,2})[.\-/_ ](\d{1,2})[.\-/_ ](\d{2,4})", s)
+                    if m:
+                        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                        if y < 100:
+                            y += 2000
+                        return (d, mo, y)
+                    m = re.search(r"(\d{1,2})\s+([а-я]+)\s+(\d{2,4})", s)
+                    if m:
+                        d, mon_word, y = int(m.group(1)), m.group(2), int(m.group(3))
+                        for stem, mo in _MONTHS_RU.items():
+                            if mon_word.startswith(stem):
+                                if y < 100:
+                                    y += 2000
+                                return (d, mo, y)
+                    return None
+
+                def _contract_row_equivalent(row: dict) -> bool:
+                    a = (row.get("value_in_plan") or "").strip()
+                    b = (row.get("value_in_other") or "").strip()
+                    if not a or not b:
+                        return False
+                    field_lc = (row.get("field") or "").lower()
+                    if "дата" in field_lc:
+                        da, db = _parse_date(a), _parse_date(b)
+                        return da is not None and da == db
+                    # Номера: сравниваем по «значащим» символам.
+                    na, nb = _norm_contract_num(a), _norm_contract_num(b)
+                    return bool(na) and na == nb
+
+                normalized_any = False
+                for row in extracted:
+                    if isinstance(row, dict) and row.get("match") is False and _contract_row_equivalent(row):
+                        row["match"] = True
+                        row["_normalized_override"] = True
+                        normalized_any = True
+
+                # Если после нормализации все строки match=true, а модель поставила NOK
+                # из-за форматного расхождения — переворачиваем вердикт.
+                if normalized_any and nok and all(
+                    (r.get("match") is True) for r in extracted if isinstance(r, dict)
+                ):
+                    ok, nok = True, False
+                    result["reason"] = (
+                        "Номер/дата договора совпадают (различия только в форматировании — "
+                        "пробелы/разделители/двузначный vs четырёхзначный год)."
+                    )
+
             for row in extracted:
                 if not isinstance(row, dict):
                     continue
@@ -1976,8 +2049,11 @@ ITEM_RULES = {
         "comparison": True,
         "compare_fields": "№ договора, дата договора, № и дата доп.соглашения (если есть)",
         "extra_instructions": (
-            "В шаблоне Плана пункт 4 — \"Наименование и адрес аудитируемых производственных площадок\". "
-            "Дата и № договора (а также № и дата доп.соглашения, если есть) должны совпадать с файлом \"Договор\". "
+            "В шаблоне Плана пункт 2 — \"Основание (номер и дата заявки и/или договора)\". "
+            "В этой строке найди номер и дату договора (обычно в форме 'Договор №<номер> от <дата>'). "
+            "Они должны совпадать с реквизитами из файла \"Договор\" (а если есть доп.соглашение — то и с ним). "
+            "Если в источниках несколько договоров — для сверки выбирай тот, чей номер/дата совпадают с указанными в пункте 2 Плана; "
+            "остальные договоры в реквизиты этого пункта не вмешивай. "
             "NOK если номер/дата договора не совпали или не упомянуто доп.соглашение, когда оно реально присутствует в источниках.\n\n"
             "НОРМАЛИЗАЦИЯ ПРИ СРАВНЕНИИ НОМЕРОВ ДОГОВОРА И ДАТ (обязательно):\n"
             "- Игнорируй пробелы внутри номера: '17 60-25' ≡ '17-60-25' ≡ '17/60/25'.\n"
@@ -2301,6 +2377,37 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         f"[авто-NOK: в Плане {src}: ни одного отмеченного чекбокса "
                         f"(☐×{unchecked}, ☑/☒×0). Вид аудита обязан быть выбран галочкой — "
                         f"если модель сказала иначе, это ошибка распознавания.]"
+                    )
+
+            # Пункт 5 (idx=4, ОКВЭД/область сертификации):
+            # Если из двух нужных файлов (Разбивка ОКВЭД и Сертификат ИГС) загружен
+            # только один — переписать reason на понятный для аудитора, без
+            # технического префикса «авто-NOK: режим сверки требует ...».
+            if idx == 4:
+                names_lc = [f.lower() for f in relevant]
+                has_razbivka = any(
+                    ("разбивк" in n) or ("оквэд" in n) for n in names_lc
+                )
+                has_cert = any(
+                    ("сертификат" in n and "макет" not in n)
+                    or (" игс" in f" {n} ") or ("(игс)" in n)
+                    for n in names_lc
+                )
+                if (has_razbivka and not has_cert) or (has_cert and not has_razbivka):
+                    missing = "Сертификат ИГС" if has_razbivka else "Разбивка кодов ОКВЭД"
+                    verdict["ok"] = False
+                    verdict["nok"] = True
+                    verdict["reason"] = (
+                        f"Не загружен файл «{missing}» — для сверки формулировки "
+                        f"области применения СМК нужны оба источника (Разбивка ОКВЭД и Сертификат ИГС). "
+                        f"Загрузите недостающий файл и повторите проверку."
+                    )
+                elif not has_razbivka and not has_cert:
+                    verdict["ok"] = False
+                    verdict["nok"] = True
+                    verdict["reason"] = (
+                        "Не загружены файлы «Разбивка кодов ОКВЭД» и «Сертификат ИГС» — "
+                        "сверка формулировки области применения СМК невозможна."
                     )
 
             # Пункт 11 (idx=10): исключения из СТО. Только п. 7.1.3.5 (1 абзац) и
