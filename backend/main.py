@@ -158,11 +158,11 @@ _W14_NS = "http://schemas.microsoft.com/office/word/2010/wordml"
 
 
 def _extract_checkboxes_from_docx_xml(file_path: str) -> str:
-    """Достаёт состояние галочек/крестиков из document.xml (SDT-checkbox и Wingdings-символы)."""
+    """Достаёт состояние галочек/крестиков из document.xml (SDT-checkbox и Wingdings-символы).
+    Подпись каждой отметки — текст параграфа, в котором лежит чекбокс (без самого глифа)."""
     import zipfile
     from xml.etree import ElementTree as ET
 
-    findings = []
     try:
         with zipfile.ZipFile(file_path) as z:
             with z.open('word/document.xml') as f:
@@ -172,7 +172,68 @@ def _extract_checkboxes_from_docx_xml(file_path: str) -> str:
 
     root = tree.getroot()
 
-    # 1) SDT checkboxes (Word 2010+)
+    checked_codes = {"f0fe", "f052", "f0fc", "f0d8", "fe", "52", "fc"}
+    unchecked_codes = {"f0a8", "a8", "f06f", "6f"}
+
+    findings = []  # list of (is_checked, label)
+
+    # ElementTree не хранит ссылки на родителей — собираем карту.
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+
+    def _find_ancestor(elem, tag_suffix: str):
+        cur = parent_map.get(elem)
+        while cur is not None and not cur.tag.endswith(tag_suffix):
+            cur = parent_map.get(cur)
+        return cur
+
+    def _label_text(node, exclude_elem=None) -> str:
+        """Собирает текст из поддерева node, исключая поддерево exclude_elem."""
+        if node is None:
+            return ""
+        parts = []
+        def walk(n):
+            if n is exclude_elem:
+                return
+            if n.text:
+                parts.append(n.text)
+            for ch in n:
+                walk(ch)
+                if ch.tail:
+                    parts.append(ch.tail)
+        walk(node)
+        text = re.sub(r"[☐☑☒]", "", "".join(parts)).strip()
+        return re.sub(r"\s+", " ", text)
+
+    def _label_near_checkbox(elem) -> str:
+        """Подпись чекбокса. Пробуем по нарастающей: текст параграфа, соседняя
+        ячейка строки, ближайший непустой текст в той же строке таблицы."""
+        para = _find_ancestor(elem, "}p")
+        label = _label_text(para, exclude_elem=elem) if para is not None else ""
+        if label:
+            return label
+        # Ближайший контейнер чекбокса — либо ячейка таблицы (}tc), либо
+        # сам SDT, который выступает «в позиции ячейки» строки.
+        tc = _find_ancestor(elem, "}tc")
+        own_slot = tc if tc is not None else _find_ancestor(elem, "}sdt") or elem
+        tr = _find_ancestor(own_slot, "}tr")
+        if tr is None:
+            return ""
+        # Соберём всех «соседей по строке»: tc/sdt — то есть все прямые дети tr,
+        # которые могут нести текст (исключая trPr).
+        siblings = [c for c in tr if c.tag.endswith("}tc") or c.tag.endswith("}sdt")]
+        try:
+            ix = siblings.index(own_slot)
+        except ValueError:
+            ix = -1
+        # Берём первую непустую соседнюю «ячейку» справа, затем слева.
+        order = siblings[ix + 1 :] + list(reversed(siblings[:ix])) if ix >= 0 else siblings
+        for cand in order:
+            t = _label_text(cand, exclude_elem=elem)
+            if t:
+                return t
+        return ""
+
+    # 1) SDT checkboxes (Word 2010+) — пробегаем по всем SDT, не только внутри параграфов.
     for sdt in root.iter(f"{{{_W_NS}}}sdt"):
         cb = sdt.find(f".//{{{_W14_NS}}}checkbox")
         if cb is None:
@@ -182,31 +243,19 @@ def _extract_checkboxes_from_docx_xml(file_path: str) -> str:
         if checked_el is not None:
             v = checked_el.get(f"{{{_W14_NS}}}val", "")
             is_checked = v in ("1", "true")
-        ctx = ''.join(sdt.itertext()).strip()
-        # пытаемся подцепить контекст параграфа
-        parent_p = sdt
-        while parent_p is not None and not parent_p.tag.endswith('}p'):
-            parent_p = root.find(f".//*[.='{ctx}']/..") if False else None
-            break
-        findings.append((is_checked, ctx[:200]))
+        label = _label_near_checkbox(sdt)
+        findings.append((is_checked, (label or "(без подписи)")[:200]))
 
-    # 2) Wingdings-символы галочек/крестиков в w:sym
-    # Wingdings 2: F052 — ☒ (X в квадрате); F0A3 — V; F052 — крест.
-    # Wingdings: F0FE — ☒, F0A8 — ☐.
-    checked_codes = {"f0fe", "f052", "f0fc", "f0d8", "fe", "52", "fc"}
-    unchecked_codes = {"f0a8", "a8", "f06f", "6f"}
-
-    for para in root.iter(f"{{{_W_NS}}}p"):
-        para_text = ''.join(para.itertext()).strip()
-        for sym in para.iter(f"{{{_W_NS}}}sym"):
-            char = sym.get(f"{{{_W_NS}}}char", "").lower()
-            font = sym.get(f"{{{_W_NS}}}font", "").lower()
-            if "wingdings" not in font and "symbol" not in font:
-                continue
-            if char in checked_codes:
-                findings.append((True, para_text[:200]))
-            elif char in unchecked_codes:
-                findings.append((False, para_text[:200]))
+    # 2) Wingdings/Symbol-символы галочек/крестиков в w:sym.
+    for sym in root.iter(f"{{{_W_NS}}}sym"):
+        char = sym.get(f"{{{_W_NS}}}char", "").lower()
+        font = sym.get(f"{{{_W_NS}}}font", "").lower()
+        if "wingdings" not in font and "symbol" not in font:
+            continue
+        if char in checked_codes or char in unchecked_codes:
+            label = _label_near_checkbox(sym)
+            is_checked = char in checked_codes
+            findings.append((is_checked, (label or "(без подписи)")[:200]))
 
     if not findings:
         return ""
@@ -1980,30 +2029,24 @@ ITEM_RULES = {
     },
     2: {
         "file_keywords": ["трудоемкост", "трудоёмкост", "расчет труд", "расчёт труд"],
-        "comparison": True,
-        "compare_fields": "общее число чел.-дней, число дней аудита, распределение по экспертам",
         "extra_instructions": (
-            "Сравниваем РАСЧЁТ ТРУДОЁМКОСТИ с фактическим Планом аудита.\n\n"
-            "ИЗ ФАЙЛА «Расчёт трудоёмкости» извлеки числа:\n"
-            "  R_total_md   — общая трудоёмкость в чел.-днях (сумма по всем экспертам/этапам).\n"
-            "  R_days       — число календарных/рабочих дней аудита по расчёту.\n"
-            "  R_experts    — число экспертов в расчёте (если указано).\n"
-            "ИЗ ФАЙЛА «План аудита» извлеки те же величины:\n"
-            "  P_total_md   — сумма чел.-дней по Плану (по дням × число экспертов, привлечённых в день).\n"
-            "  P_days       — число дней в графике Плана (раздел «Сроки проведения аудита»).\n"
-            "  P_experts    — число экспертов из состава ЭГ в Плане.\n\n"
-            "ОБЯЗАТЕЛЬНО заполни extracted_values отдельными строками:\n"
-            "  1) field='Общая трудоёмкость, чел.-дни', value_in_plan=P_total_md, value_in_other=R_total_md, "
-            "     other_file=<имя файла расчёта>, match=true только при численном равенстве.\n"
-            "  2) field='Число дней аудита',           value_in_plan=P_days,     value_in_other=R_days, "
-            "     match=true только при равенстве.\n"
-            "  3) field='Число экспертов в ЭГ',         value_in_plan=P_experts,  value_in_other=R_experts, "
-            "     match=true только при равенстве (если в одном из источников нет — match=false).\n\n"
+            "Подтверждаем НАЛИЧИЕ расчёта трудоёмкости для текущего аудита.\n\n"
+            "ВЫПОЛНИ:\n"
+            "1. Убедись, что файл «Расчёт трудоёмкости» загружен и в нём есть строка про тот же "
+            "тип аудита, что указан в Плане (Первый/Второй инспекционный контроль, "
+            "Ресертификационный аудит, Первый/Второй этап первичной сертификации и т.п.).\n"
+            "2. Убедись, что у этой строки есть числовое значение трудоёмкости (чел.-дни).\n\n"
             "ВЕРДИКТ:\n"
-            "  OK — только если ВСЕ три строки имеют match=true.\n"
-            "  NOK — если хотя бы одна не совпала, либо если из расчёта не удалось извлечь числа.\n"
-            "В reason приведи все 6 чисел и явный список расхождений. "
-            "НЕ ставь OK с формулировкой «соответствует» без конкретных чисел — это считается ошибкой проверки."
+            "  OK — файл загружен, тип аудита из Плана найден в Расчёте, есть числовое значение.\n"
+            "  NOK — файл не загружен, ИЛИ в Расчёте нет строки про тот тип аудита, что в Плане, "
+            "  ИЛИ у строки нет числового значения.\n\n"
+            "СТРОГО НЕ ДЕЛАЙ:\n"
+            "  – Не сравнивай детальные числа (количество дней × количество экспертов из Плана) "
+            "    с цифрой трудоёмкости из Расчёта. Они могут расходиться (поправочные коэффициенты, "
+            "    учёт переезда, разные методики) — это НОРМАЛЬНО.\n"
+            "  – Не ставь NOK по причине «не совпала формула расчёта».\n\n"
+            "Reason: короткая фраза вида «Расчёт трудоёмкости для «Первый инспекционный контроль» "
+            "загружен, значение — 9,5 чел.-дней — OK». extracted_values НЕ заполняй."
         ),
     },
     3: {
@@ -2735,6 +2778,74 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         f"(☐×{unchecked}, ☑/☒×0). Вид аудита обязан быть выбран галочкой — "
                         f"если модель сказала иначе, это ошибка распознавания.]"
                     )
+                else:
+                    # Достаём отмеченные виды из секции ОТМЕТКИ (если есть подписи)
+                    # и из текста Плана. Считаем OK, если вид из Приказа есть среди
+                    # отмеченных в Плане. «Расширение области сертификации» —
+                    # допустимое дополнение, не повод для NOK.
+                    AUDIT_TYPE_KEYWORDS = {
+                        "первый инспекционный": ["первый инспекцион", "1 ик", "1ик", "первого инспекцион"],
+                        "второй инспекционный": ["второй инспекцион", "2 ик", "2ик", "второго инспекцион"],
+                        "внеплановый инспекционный": ["внеплановый инспекцион", "внеплановый ик"],
+                        "первый этап первичного": ["первый этап первичного", "1 этап первичной", "1-й этап перв"],
+                        "второй этап первичного": ["второй этап первичного", "2 этап первичной", "2-й этап перв"],
+                        "ресертификационный": ["ресертификационн"],
+                        "дополнительный": ["дополнительный аудит"],
+                        "расширение области": ["расширение области"],
+                    }
+                    # Виды, отмеченные в Плане: ищем по соседству с ☑/☒.
+                    marked_in_plan = set()
+                    for m in re.finditer(r"[☑☒]\s*([^☐☑☒\n]{4,120})", plan_raw):
+                        label = m.group(1).lower().replace("ё", "е")
+                        for canon, kws in AUDIT_TYPE_KEYWORDS.items():
+                            if any(k in label for k in kws):
+                                marked_in_plan.add(canon)
+
+                    # Вид аудита из Приказа: ищем в файлах с «приказ» в имени.
+                    prikaz_text = ""
+                    for fn, txt in all_texts.items():
+                        if ("приказ" in fn.lower() or "эг" in fn.lower()) and txt:
+                            prikaz_text += " " + txt
+                    prikaz_lc = prikaz_text.lower().replace("ё", "е")
+                    type_in_prikaz = None
+                    # Приоритет «инспекционный контроль» (формальный вид аудита),
+                    # «расширение области» в Приказе — расширение, не сам тип.
+                    priority = [
+                        "первый инспекционный", "второй инспекционный", "внеплановый инспекционный",
+                        "ресертификационный", "первый этап первичного", "второй этап первичного",
+                        "дополнительный",
+                    ]
+                    for canon in priority:
+                        kws = AUDIT_TYPE_KEYWORDS[canon]
+                        if any(k in prikaz_lc for k in kws):
+                            type_in_prikaz = canon
+                            break
+
+                    print(
+                        f"[item 4 type-check] marked_in_plan={sorted(marked_in_plan)} "
+                        f"type_in_prikaz={type_in_prikaz}"
+                    )
+
+                    if type_in_prikaz and type_in_prikaz in marked_in_plan:
+                        extras = sorted(marked_in_plan - {type_in_prikaz})
+                        verdict["ok"] = True
+                        verdict["nok"] = False
+                        reason = (
+                            f"Вид аудита из Приказа «{type_in_prikaz}» отмечен в Плане."
+                        )
+                        if extras:
+                            reason += (
+                                f" Дополнительно в Плане отмечено: {', '.join(extras)} "
+                                f"(допустимое сопровождение)."
+                            )
+                        verdict["reason"] = reason
+                    elif type_in_prikaz and marked_in_plan and type_in_prikaz not in marked_in_plan:
+                        verdict["ok"] = False
+                        verdict["nok"] = True
+                        verdict["reason"] = (
+                            f"Вид аудита из Приказа «{type_in_prikaz}» НЕ отмечен в Плане. "
+                            f"В Плане отмечено: {', '.join(sorted(marked_in_plan)) or 'ничего'}."
+                        )
 
             # Пункт 6 (idx=5, договор): детерминированная сверка реквизитов.
             # Из Плана извлекаем номер и дату договора (пункт 2 «Основание»),
