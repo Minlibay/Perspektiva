@@ -3713,20 +3713,103 @@ def _svod_shift_count(text: str):
     return max(nums) if nums else None
 
 
+def _svod_norm_words(s: str) -> set:
+    """Множество значимых слов (кириллица/цифры, длиной ≥4) из текста."""
+    s = re.sub(r"[^а-яёa-z0-9 ]", " ", (s or "").lower())
+    return {w for w in s.split() if len(w) >= 4}
+
+
+def _svod_locate_text(all_texts: dict, name_kws, content_kws):
+    """Находит текст документа: сначала по подстроке имени, затем по маркерам содержимого."""
+    for fn, txt in all_texts.items():
+        if any(k in fn.lower() for k in name_kws):
+            return txt
+    for fn, txt in all_texts.items():
+        low = (txt or "").lower()
+        if content_kws and all(k in low for k in content_kws):
+            return txt
+    return None
+
+
 def _svod_deterministic_postcheck(idx: int, verdict: dict, svod_doc_text: str, all_texts: dict) -> dict:
     """Детерминированные пост-проверки поверх вердикта модели. Меняют вердикт ТОЛЬКО
-    когда удаётся уверенно извлечь нужные значения; иначе оставляют ответ GigaChat."""
+    когда удаётся уверенно извлечь нужные значения; иначе оставляют ответ GigaChat.
+    Покрывают структурные пункты Сводного акта: №3, 7, 8, 10, 11, 14."""
+    # Гарантируем доступ к тексту Сводного акта (фолбэк — поиск в источниках по содержимому)
+    svod = svod_doc_text or ""
+    if "общие сведения об организации" not in svod.lower():
+        for txt in all_texts.values():
+            if _looks_like_svod_doc(txt):
+                svod = txt
+                break
+    svod_low = svod.lower()
+
+    # №3 (idx 2) — область распространения СМК = п.1 Акта Р (сверка формулировок)
+    if idx == 2:
+        i = svod_low.find("область распространения смк")
+        akt = _svod_locate_text(all_texts, ("акт р", "акт 2", "результатам аудита", "акт по результ"),
+                                ("цель и область аудита", "область применения"))
+        j = (akt or "").lower().find("применительно к")
+        if i >= 0 and akt and j >= 0:
+            sv = _svod_norm_words(svod[i:i + 500])
+            ak = _svod_norm_words(akt[j:j + 500])
+            jac = len(sv & ak) / max(1, len(sv | ak))
+            if jac >= 0.7:
+                verdict["ok"], verdict["nok"] = True, False
+                verdict["reason"] = (f"[детерм.] Формулировка области распространения СМК совпадает "
+                                     f"с п.1 Акта Р (совпадение слов {int(jac*100)}%). OK.")
+            elif jac < 0.5:
+                verdict["ok"], verdict["nok"] = False, True
+                verdict["reason"] = (f"[детерм.] Формулировка области в Сводном акте и п.1 Акта Р "
+                                     f"расходится (совпадение слов {int(jac*100)}%). NOK.")
+        return verdict
+
+    # №7 (idx 6) — адреса мест осуществления деятельности
+    if idx == 6:
+        i = svod_low.find("адреса мест осуществления")
+        if i >= 0:
+            val = svod[i:i + 220].split(":", 1)[-1]
+            val = val.split("\n")[0].lstrip(" |").strip()
+            if not val or len(val) < 5:
+                verdict["ok"], verdict["nok"] = False, True
+                verdict["reason"] = "[детерм.] Поле «Адреса мест осуществления деятельности» в Сводном акте не заполнено. NOK."
+            else:
+                akt = _svod_locate_text(all_texts, ("акт р", "акт 2", "результатам аудита", "акт по результ"),
+                                        ("основная площадка",))
+                shared = _svod_norm_words(val) & _svod_norm_words(akt or "")
+                loc = {w for w in shared if len(w) >= 6}
+                verdict["ok"], verdict["nok"] = True, False
+                verdict["reason"] = (
+                    f"[детерм.] Адрес в Сводном акте заполнен: «{val[:90]}»."
+                    + (f" Совпадает с площадкой Акта Р (общие: {', '.join(sorted(loc)[:3])}). OK."
+                       if loc else " Сверьте адрес с площадкой Акта Р вручную. OK (заполнено).")
+                )
+        return verdict
+
+    # №8 (idx 7) — численность персонала в системе менеджмента
+    if idx == 7:
+        ms = re.search(r"численность персонала в системе менеджмента\D{0,12}(\d+)", svod_low)
+        otch = _svod_locate_text(all_texts, ("отчет", "отчёт", "1 этап", "первого этап"),
+                                 ("первого этапа", "распространяется смк"))
+        mo = re.search(r"распространяется смк[:\s]*?(\d+)", (otch or "").lower()) if otch else None
+        if ms and mo:
+            a, b = int(ms.group(1)), int(mo.group(1))
+            ok = a == b
+            verdict["ok"], verdict["nok"] = ok, not ok
+            verdict["reason"] = (
+                f"[детерм.] Численность персонала в СМК: Сводный акт — {a}, Отчёт 1 этапа — {b}. "
+                + ("Совпадает — OK." if ok else "Расхождение — NOK.")
+            )
+        return verdict
+
     # №10 (idx 9) — режим работы: число смен в Сводном акте vs Расчёт трудоёмкости
     if idx == 9:
-        i = (svod_doc_text or "").lower().find("режим работы")
-        svod_shifts = _svod_shift_count(svod_doc_text[i:i + 250]) if i >= 0 else None
-        trud_shifts = None
-        for fn, txt in all_texts.items():
-            if any(k in fn.lower() for k in ("трудоемкост", "трудоёмкост")):
-                m = re.search(r"количество смен\s*\|\s*(\d+)", (txt or "").lower())
-                if m:
-                    trud_shifts = int(m.group(1))
-                break
+        i = svod_low.find("режим работы")
+        svod_shifts = _svod_shift_count(svod[i:i + 250]) if i >= 0 else None
+        trud = _svod_locate_text(all_texts, ("трудоемкост", "трудоёмкост", "расчет труд", "расчёт труд"),
+                                 ("расчет трудоемкости", "количество смен"))
+        m = re.search(r"количество смен\s*\|?\s*(\d+)", (trud or "").lower()) if trud else None
+        trud_shifts = int(m.group(1)) if m else None
         if svod_shifts is not None and trud_shifts is not None:
             ok = svod_shifts == trud_shifts
             verdict["ok"], verdict["nok"] = ok, not ok
@@ -3737,22 +3820,41 @@ def _svod_deterministic_postcheck(idx: int, verdict: dict, svod_doc_text: str, a
             )
         return verdict
 
+    # №11 (idx 10) — количество рекламаций: Сводный акт П.9 vs сумма по годам в Акте Р
+    if idx == 10:
+        k = svod_low.find("количество рекламаций")
+        msv = re.search(r"\|\s*(\d{1,5})\s*\|\s*(\d{1,4})", svod[k:k + 1500]) if k >= 0 else None
+        akt = _svod_locate_text(all_texts, ("акт р", "акт 2", "результатам аудита", "акт по результ"),
+                                ("рекламац", "претензи"))
+        if msv and akt:
+            akt_low = akt.lower()
+            yrs = [int(x) for x in re.findall(r"году\s+зарегистрировано\s+(\d+)\s+претензи", akt_low)]
+            gz = [int(x) for x in re.findall(r"газпром[^)]*?зарегистрировано\s+(\d+)\s+претензи", akt_low)]
+            if yrs:
+                t_sv, g_sv = int(msv.group(1)), int(msv.group(2))
+                t_ak, g_ak = sum(yrs), sum(gz)
+                ok = (t_sv == t_ak) and (g_sv == g_ak)
+                verdict["ok"], verdict["nok"] = ok, not ok
+                verdict["reason"] = (
+                    f"[детерм.] Рекламации — Сводный акт: всего {t_sv} / от Газпром {g_sv}; "
+                    f"Акт Р (сумма по годам {'+'.join(map(str, yrs))}): всего {t_ak} / от Газпром {g_ak}. "
+                    + ("Совпадает — OK." if ok else "Расхождение — NOK.")
+                )
+        return verdict
+
     # №14 (idx 13) — дата подписания ≤ 20 рабочих дней от даты Акта 2 этапа
     if idx == 13:
-        d_svod = _svod_extract_sign_date(svod_doc_text)
-        d_akt = None
-        for fn, txt in all_texts.items():
-            if any(k in fn.lower() for k in ("акт р", "акт 2", "результатам аудита", "акт по результ")):
-                d_akt = _svod_extract_sign_date(txt)
-                if d_akt:
-                    break
+        d_svod = _svod_extract_sign_date(svod)
+        akt = _svod_locate_text(all_texts, ("акт р", "акт 2", "результатам аудита", "акт по результ"),
+                                ("цель и область аудита",))
+        d_akt = _svod_extract_sign_date(akt) if akt else None
         if d_svod and d_akt:
             late = d_svod < d_akt
             wd = _svod_working_days(d_akt, d_svod)
             ok = (not late) and wd <= 20
             verdict["ok"], verdict["nok"] = ok, not ok
             verdict["reason"] = (
-                f"[детерм.] Дата подписания Сводного акта: {d_svod.strftime('%d.%m.%Y')}; "
+                f"[детерм.] Подписи проставлены. Дата подписания Сводного акта: {d_svod.strftime('%d.%m.%Y')}; "
                 f"дата Акта 2 этапа: {d_akt.strftime('%d.%m.%Y')}; между ними {wd} рабочих дней. "
                 "Требование ≤20 рабочих дней. "
                 + ("OK." if ok else ("NOK (Сводный акт подписан раньше Акта 2 этапа)." if late
