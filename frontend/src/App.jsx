@@ -1,5 +1,5 @@
 import { useState, useEffect, Fragment } from 'react'
-import { Container, Row, Col, Card, Button, Form, Alert, Spinner, Table, Badge, Collapse, ProgressBar } from 'react-bootstrap'
+import { Container, Row, Col, Card, Button, Form, Alert, Spinner, Table, Badge, Collapse, ProgressBar, Modal } from 'react-bootstrap'
 import axios from 'axios'
 import './App.css'
 
@@ -94,9 +94,9 @@ function App() {
   const [availableModels, setAvailableModels] = useState(KNOWN_MODELS)
   const [diagnosing, setDiagnosing] = useState(false)
   const [diagnose, setDiagnose] = useState(null)
-  const [files, setFiles] = useState({ plan: null, planDoc: null, sources: [] })
-  const [uploadedFiles, setUploadedFiles] = useState({ plan: null, planDoc: null, sources: [] })
-  const [uploadProgress, setUploadProgress] = useState({ plan: null, planDoc: null, sources: null })
+  const [files, setFiles] = useState({ plan: null, plan2: null, planDoc: null, planDoc2: null, sources: [] })
+  const [uploadedFiles, setUploadedFiles] = useState({ plan: null, plan2: null, planDoc: null, planDoc2: null, sources: [] })
+  const [uploadProgress, setUploadProgress] = useState({ plan: null, plan2: null, planDoc: null, planDoc2: null, sources: null })
   const [processing, setProcessing] = useState(false)
   const [progress, setProgress] = useState(null)
   const [result, setResult] = useState(null)
@@ -107,6 +107,7 @@ function App() {
   const [startTime, setStartTime] = useState(null)
   const [elapsed, setElapsed] = useState(0)
   const [showAdmin, setShowAdmin] = useState(false)
+  const [showInstructions, setShowInstructions] = useState(false)
   const [adminSessions, setAdminSessions] = useState([])
   const [adminLoading, setAdminLoading] = useState(false)
   const [adminExpanded, setAdminExpanded] = useState({})
@@ -280,8 +281,12 @@ function App() {
     const selectedFiles = Array.from(e.target.files)
     if (type === 'plan') {
       setFiles(prev => ({ ...prev, plan: selectedFiles[0] || null }))
+    } else if (type === 'plan2') {
+      setFiles(prev => ({ ...prev, plan2: selectedFiles[0] || null }))
     } else if (type === 'planDoc') {
       setFiles(prev => ({ ...prev, planDoc: selectedFiles[0] || null }))
+    } else if (type === 'planDoc2') {
+      setFiles(prev => ({ ...prev, planDoc2: selectedFiles[0] || null }))
     } else if (type === 'sources') {
       setFiles(prev => ({ ...prev, sources: selectedFiles }))
     }
@@ -344,6 +349,42 @@ function App() {
     } catch (e) {}
   }
 
+  const uploadPlanDoc2 = async () => {
+    if (!files.planDoc2) {
+      setError('Выберите второй проверяемый документ')
+      return
+    }
+    const formData = new FormData()
+    formData.append('files', files.planDoc2)
+    formData.append('file_type', 'plan_doc')
+    formData.append('block', 'plan')
+    if (sessionId) formData.append('session_id', sessionId)
+    try {
+      const res = await doUpload('planDoc2', formData, 'Ошибка загрузки второго проверяемого документа')
+      if (res.data.session_id) setSessionId(res.data.session_id)
+      setUploadedFiles(prev => ({ ...prev, planDoc2: res.data.uploaded_files[0] }))
+      setFiles(prev => ({ ...prev, planDoc2: null }))
+    } catch (e) {}
+  }
+
+  const uploadPlan2 = async () => {
+    if (!files.plan2) {
+      setError('Выберите второй чек-лист')
+      return
+    }
+    const formData = new FormData()
+    formData.append('files', files.plan2)
+    formData.append('file_type', 'plan')
+    formData.append('block', 'checklist')
+    if (sessionId) formData.append('session_id', sessionId)
+    try {
+      const res = await doUpload('plan2', formData, 'Ошибка загрузки второго чек-листа')
+      if (res.data.session_id) setSessionId(res.data.session_id)
+      setUploadedFiles(prev => ({ ...prev, plan2: res.data.uploaded_files[0] }))
+      setFiles(prev => ({ ...prev, plan2: null }))
+    } catch (e) {}
+  }
+
   const uploadSources = async () => {
     if (files.sources.length === 0) {
       setError('Выберите файлы источников')
@@ -395,8 +436,12 @@ function App() {
   const removeFile = (type, index = null) => {
     if (type === 'plan') {
       setUploadedFiles(prev => ({ ...prev, plan: null }))
+    } else if (type === 'plan2') {
+      setUploadedFiles(prev => ({ ...prev, plan2: null }))
     } else if (type === 'planDoc') {
       setUploadedFiles(prev => ({ ...prev, planDoc: null }))
+    } else if (type === 'planDoc2') {
+      setUploadedFiles(prev => ({ ...prev, planDoc2: null }))
     } else if (type === 'sources' && index !== null) {
       setUploadedFiles(prev => ({
         ...prev,
@@ -411,7 +456,11 @@ function App() {
       return
     }
     if (!uploadedFiles.plan) {
-      setError('Загрузите файл "ИИ -ЧК -План АУДИТА"')
+      setError('Загрузите чек-лист в поле 1 («План АУДИТА» или «Сводный акт»)')
+      return
+    }
+    if (!uploadedFiles.planDoc) {
+      setError('Загрузите проверяемый документ в поле 2')
       return
     }
     if (uploadedFiles.sources.length === 0) {
@@ -436,8 +485,14 @@ function App() {
       formData.append('api_key', apiKey)
       formData.append('template_file', uploadedFiles.plan.filename || uploadedFiles.plan.name)
       formData.append('session_id', sessionId)
+      if (uploadedFiles.plan2) {
+        formData.append('template_file_2', uploadedFiles.plan2.filename || uploadedFiles.plan2.name)
+      }
       if (uploadedFiles.planDoc) {
         formData.append('plan_doc_file', uploadedFiles.planDoc.filename || uploadedFiles.planDoc.name)
+      }
+      if (uploadedFiles.planDoc2) {
+        formData.append('plan_doc_file_2', uploadedFiles.planDoc2.filename || uploadedFiles.planDoc2.name)
       }
 
       const res = await axios.post(`${API_BASE}/api/process`, formData, {
@@ -453,18 +508,14 @@ function App() {
     }
   }
 
-  const downloadResult = async () => {
-    if (!result?.output_file) return
-
+  const downloadByRef = async (ref) => {
+    if (!ref) return
     try {
-      const res = await axios.get(`${API_BASE}/api/download/${result.output_file}`, {
-        responseType: 'blob'
-      })
-      
+      const res = await axios.get(`${API_BASE}/api/download/${ref}`, { responseType: 'blob' })
       const url = window.URL.createObjectURL(new Blob([res.data]))
       const link = document.createElement('a')
       link.href = url
-      link.setAttribute('download', result.output_file)
+      link.setAttribute('download', ref.split('/').pop() || ref)
       document.body.appendChild(link)
       link.click()
       link.remove()
@@ -473,9 +524,24 @@ function App() {
     }
   }
 
+  // Список результатов: новый формат outputs[] либо back-compat одиночный output_file
+  const resultOutputs = () => {
+    if (result?.outputs && result.outputs.length) return result.outputs
+    if (result?.output_file) return [{ type: 'plan', output_file: result.output_file }]
+    return []
+  }
+  const outputLabel = (o) => (o.type === 'svod' ? 'Сводный акт' : 'План АУДИТА')
+
   return (
     <Container fluid className="py-4">
-      <div className="d-flex justify-content-end mb-2">
+      <div className="d-flex justify-content-end gap-2 mb-2">
+        <Button
+          size="sm"
+          variant="outline-primary"
+          onClick={() => setShowInstructions(true)}
+        >
+          📖 Инструкция
+        </Button>
         <Button
           size="sm"
           variant={showAdmin ? 'dark' : 'outline-dark'}
@@ -484,6 +550,85 @@ function App() {
           {showAdmin ? '← К рабочему режиму' : '🔧 Админ'}
         </Button>
       </div>
+
+      <Modal show={showInstructions} onHide={() => setShowInstructions(false)} size="lg" scrollable>
+        <Modal.Header closeButton>
+          <Modal.Title>📖 Инструкция: какие файлы в какое поле</Modal.Title>
+        </Modal.Header>
+        <Modal.Body>
+          <p className="text-muted">
+            Приложение заполняет один или два чек-листа аудитора. Тип каждого чек-листа
+            («План АУДИТА» или «Сводный акт») определяется автоматически — порядок загрузки не важен.
+          </p>
+
+          <Card className="mb-3 border-primary">
+            <Card.Header className="bg-primary text-white">📄 Поле 1 — Чек-лист(ы) аудитора</Card.Header>
+            <Card.Body>
+              <p className="mb-2">Сюда грузим <strong>сам чек-лист</strong> (бланк с пунктами проверки). Можно один или оба:</p>
+              <ul className="mb-2">
+                <li><strong>«ИИ -ЧК -План АУДИТА»</strong> — чек-лист для Плана аудита;</li>
+                <li><strong>«ЧК -Сводный акт»</strong> — чек-лист для Сводного акта.</li>
+              </ul>
+              <p className="mb-0 small text-muted">
+                Нужны оба — первый в основное поле, второй через «Загрузить 2-й чек-лист». Нужен один — грузим
+                только его. Обработка идёт по очереди: сначала План, затем Сводный акт; на каждый — свой выходной файл.
+              </p>
+            </Card.Body>
+          </Card>
+
+          <Card className="mb-3 border-info">
+            <Card.Header className="bg-info text-white">📋 Поле 2 — Проверяемый документ(ы)</Card.Header>
+            <Card.Body>
+              <p className="mb-2">Главный документ, который проверяем. Зависит от чек-листа:</p>
+              <ul className="mb-2">
+                <li>для ЧК «План АУДИТА» — файл <strong>«План аудита»</strong> (с разделами «Цель и область», «Основание», «Сроки», «Состав ЭГ»);</li>
+                <li>для ЧК «Сводный акт» — файл <strong>«Сводный акт исследования (итог)»</strong>.</li>
+              </ul>
+              <p className="mb-0 small text-muted">
+                Можно загрузить <strong>два</strong> документа (основное поле + «Загрузить 2-й документ»). Если работаете
+                сразу с двумя чек-листами — положите сюда и «План аудита», и «Сводный акт исследования»; система сама
+                сопоставит каждый со своим чек-листом.
+              </p>
+            </Card.Body>
+          </Card>
+
+          <Card className="mb-3 border-success">
+            <Card.Header className="bg-success text-white">📚 Поле 3 — Источники данных</Card.Header>
+            <Card.Body>
+              <p className="mb-1"><strong>Для Плана АУДИТА:</strong></p>
+              <ul className="mb-2">
+                <li>Договор (включая доп. соглашения), Заявка, Приказ о назначении ЭГ;</li>
+                <li>Файлы СТО, Акты предыдущего аудита;</li>
+                <li>Орг. структура, Разбивка области по кодам ОКВЭД, Сертификат ИГС, Расчёт трудоёмкости.</li>
+              </ul>
+              <p className="mb-1"><strong>Для Сводного акта</strong> (каждый файл закрывает свои пункты):</p>
+              <ul className="mb-2 small">
+                <li><strong>«3.1 Акт Р»</strong> (Акт по результатам аудита, 2 этап) — пункты 3, 11, 14;</li>
+                <li><strong>«4.1 Разбивка ОКВЭД»</strong> — пункт 4 (коды ОКВЭД);</li>
+                <li><strong>«4.2 Отчёт 1 этапа»</strong> — пункт 8 (численность);</li>
+                <li><strong>«6.1 Заявка»</strong> — пункты 6, 7 (площадки, адреса);</li>
+                <li><strong>«10.1 Трудоёмкость»</strong> — пункт 10 (режим работы / смены);</li>
+                <li><strong>«Шаблон Сводного акта»</strong> — пункт 2 (заполнение всех разделов).</li>
+              </ul>
+              <p className="mb-0 small text-muted">
+                Имена файлов лучше оставлять узнаваемыми (как в примерах выше) — система подбирает нужный источник по имени файла.
+                Пункты <strong>9 (Инфраструктура)</strong> и <strong>12 (Несоответствия)</strong> Сводного акта помечаются
+                «ПРОВЕРИТЬ ВРУЧНУЮ» — их аудитор сверяет сам.
+              </p>
+            </Card.Body>
+          </Card>
+
+          <Alert variant="secondary" className="mb-0">
+            <strong>Порядок работы:</strong> сохраните API-ключ GigaChat в «Админ» → чек-лист(ы) в поле 1 →
+            проверяемый документ(ы) в поле 2 → источники в поле 3 → «Запустить обработку».
+            На выходе — заполненный файл на каждый чек-лист (OK / NOK / ручные в каждом пункте) и кнопка
+            «Скачать оба (ZIP)», если чек-листов два.
+          </Alert>
+        </Modal.Body>
+        <Modal.Footer>
+          <Button variant="primary" onClick={() => setShowInstructions(false)}>Понятно</Button>
+        </Modal.Footer>
+      </Modal>
 
       <h1 className="mb-4 text-center">
         <Badge bg="primary">План АУДИТА</Badge>
@@ -707,6 +852,38 @@ function App() {
                   </Badge>
                 </div>
               )}
+
+              <hr className="my-2" />
+              <Form.Label className="text-muted small">
+                Второй чек-лист (опционально) — например «ЧК -Сводный акт». Тип определяется автоматически.
+              </Form.Label>
+              <Form.Control
+                type="file"
+                accept=".docx,.doc,.docm,.pdf,.xlsx"
+                onChange={(e) => handleFileChange('plan2', e)}
+                className="mb-2"
+              />
+              <div className="d-grid">
+                <Button
+                  variant="outline-primary"
+                  size="sm"
+                  onClick={uploadPlan2}
+                  disabled={!files.plan2 || uploadProgress.plan2 !== null}
+                >
+                  {uploadProgress.plan2 !== null ? 'Загрузка...' : 'Загрузить 2-й чек-лист'}
+                </Button>
+              </div>
+              {uploadProgress.plan2 !== null && (
+                <ProgressBar now={uploadProgress.plan2} label={`${uploadProgress.plan2}%`} animated className="mt-2" />
+              )}
+              {uploadedFiles.plan2 && (
+                <div className="mt-3">
+                  <Badge bg="primary" className="me-2 mb-2 d-inline-flex align-items-center">
+                    {uploadedFiles.plan2.filename || uploadedFiles.plan2.name}
+                    <button className="btn-close btn-close-white ms-2" style={{ fontSize: '0.6rem' }} onClick={() => removeFile('plan2')} />
+                  </Badge>
+                </div>
+              )}
             </Card.Body>
           </Card>
         </Col>
@@ -714,11 +891,14 @@ function App() {
         <Col md={4}>
           <Card className="mb-4 h-100">
             <Card.Header className="bg-info text-white">
-              📋 2. План аудита
+              📋 2. Проверяемый документ
             </Card.Header>
             <Card.Body className="d-flex flex-column">
               <Form.Label className="text-muted small">
-                Файл с Планом аудита, содержащий пункты «Цель и область аудита», «Основание», «Сроки», «Состав ЭГ» и т. д.
+                Главный проверяемый документ: <strong>План аудита</strong> (для ЧК «План АУДИТА») —
+                пункты «Цель и область», «Основание», «Сроки», «Состав ЭГ»; либо
+                <strong> Сводный акт исследования (итог)</strong> (для ЧК «Сводный акт»).
+                Если грузите оба чек-листа — добавьте оба проверяемых документа (тип определяется автоматически).
               </Form.Label>
               <Form.Control
                 type="file"
@@ -733,7 +913,7 @@ function App() {
                   onClick={uploadPlanDoc}
                   disabled={!files.planDoc || uploadProgress.planDoc !== null}
                 >
-                  {uploadProgress.planDoc !== null ? 'Загрузка...' : 'Загрузить План'}
+                  {uploadProgress.planDoc !== null ? 'Загрузка...' : 'Загрузить документ'}
                 </Button>
               </div>
               {uploadProgress.planDoc !== null && (
@@ -744,6 +924,38 @@ function App() {
                   <Badge bg="info" className="me-2 mb-2 d-inline-flex align-items-center">
                     {uploadedFiles.planDoc.filename || uploadedFiles.planDoc.name}
                     <button className="btn-close btn-close-white ms-2" style={{ fontSize: '0.6rem' }} onClick={() => removeFile('planDoc')} />
+                  </Badge>
+                </div>
+              )}
+
+              <hr className="my-2" />
+              <Form.Label className="text-muted small">
+                Второй проверяемый документ (опционально) — например «Сводный акт исследования (итог)».
+              </Form.Label>
+              <Form.Control
+                type="file"
+                accept=".docx,.doc,.docm,.pdf,.xlsx"
+                onChange={(e) => handleFileChange('planDoc2', e)}
+                className="mb-2"
+              />
+              <div className="d-grid">
+                <Button
+                  variant="outline-info"
+                  size="sm"
+                  onClick={uploadPlanDoc2}
+                  disabled={!files.planDoc2 || uploadProgress.planDoc2 !== null}
+                >
+                  {uploadProgress.planDoc2 !== null ? 'Загрузка...' : 'Загрузить 2-й документ'}
+                </Button>
+              </div>
+              {uploadProgress.planDoc2 !== null && (
+                <ProgressBar now={uploadProgress.planDoc2} label={`${uploadProgress.planDoc2}%`} animated variant="info" className="mt-2" />
+              )}
+              {uploadedFiles.planDoc2 && (
+                <div className="mt-3">
+                  <Badge bg="info" className="me-2 mb-2 d-inline-flex align-items-center">
+                    {uploadedFiles.planDoc2.filename || uploadedFiles.planDoc2.name}
+                    <button className="btn-close btn-close-white ms-2" style={{ fontSize: '0.6rem' }} onClick={() => removeFile('planDoc2')} />
                   </Badge>
                 </div>
               )}
@@ -822,19 +1034,25 @@ function App() {
             <Card.Body>
               <Row>
                 <Col md={4}>
-                  <strong>Чек-лист:</strong>{' '}
+                  <strong>Чек-лист(ы):</strong>{' '}
                   {uploadedFiles.plan ? (
-                    <Badge bg="primary">{uploadedFiles.plan.filename || uploadedFiles.plan.name}</Badge>
+                    <Badge bg="primary" className="me-1">{uploadedFiles.plan.filename || uploadedFiles.plan.name}</Badge>
                   ) : (
                     <span className="text-muted">не загружен</span>
                   )}
+                  {uploadedFiles.plan2 && (
+                    <Badge bg="primary">{uploadedFiles.plan2.filename || uploadedFiles.plan2.name}</Badge>
+                  )}
                 </Col>
                 <Col md={4}>
-                  <strong>План аудита:</strong>{' '}
+                  <strong>Проверяемый документ:</strong>{' '}
                   {uploadedFiles.planDoc ? (
-                    <Badge bg="info">{uploadedFiles.planDoc.filename || uploadedFiles.planDoc.name}</Badge>
+                    <Badge bg="info" className="me-1">{uploadedFiles.planDoc.filename || uploadedFiles.planDoc.name}</Badge>
                   ) : (
                     <span className="text-muted">не загружен</span>
+                  )}
+                  {uploadedFiles.planDoc2 && (
+                    <Badge bg="info">{uploadedFiles.planDoc2.filename || uploadedFiles.planDoc2.name}</Badge>
                   )}
                 </Col>
                 <Col md={4}>
@@ -973,134 +1191,104 @@ function App() {
                   </Alert>
                 )}
                 
-                {result.status === 'success' && result.extracted_data && (
+                {result.status === 'success' && resultOutputs().length > 0 && (
                   <>
-                    <h5>Извлечённые данные (шапка):</h5>
-                    <Table striped size="sm">
-                      <tbody>
-                        {result.extracted_data.header && Object.entries(result.extracted_data.header).map(([key, value]) => (
-                          <tr key={key}>
-                            <td style={{ width: '40%' }}><strong>{key}</strong></td>
-                            <td>{typeof value === 'string' ? value : JSON.stringify(value)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </Table>
-                    
-                    <Button 
-                      variant="outline-primary" 
-                      className="mb-3"
-                      onClick={() => setChecklistPreview(!checklistPreview)}
-                    >
-                      {checklistPreview ? '▼ Скрыть' : '▶ Показать'} чек-лист ({result.extracted_data.checklist?.length || 0} пунктов)
-                    </Button>
-                    
-                    <Collapse in={checklistPreview}>
-                      <div>
-                        <h5>Результат проверки чек-листа:</h5>
-                        <Table striped size="sm" className="mb-3">
-                          <thead>
-                            <tr>
-                              <th style={{ width: '5%' }}>#</th>
-                              <th style={{ width: '10%' }}>Статус</th>
-                              <th style={{ width: '15%' }}>ИИ данные</th>
-                              <th>Обоснование</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {result.extracted_data.checklist?.map((item, idx) => (
-                              <tr key={idx}>
-                                <td>{idx + 1}</td>
-                                <td>
-                                  {item.nok ? (
-                                    <Badge bg="danger">☒ NOK</Badge>
-                                  ) : item.ok ? (
-                                    <Badge bg="success">☑ OK</Badge>
-                                  ) : (
-                                    <Badge bg="secondary">?</Badge>
-                                  )}
-                                </td>
-                                <td>
-                                  {item.ii_data_found ? (
-                                    <Badge bg="info">{item.ii_data_found}</Badge>
-                                  ) : (
-                                    <span className="text-muted">—</span>
-                                  )}
-                                </td>
-                                <td className={item.nok ? 'text-danger' : ''}>
-                                  {item.reason || item.problems || "—"}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </Table>
-                        
-                        <Row className="mb-3">
-                          <Col>
-                            <Badge bg="success">
-                              OK: {result.extracted_data.checklist?.filter(i => i.ok).length || 0}
-                            </Badge>{' '}
-                            <Badge bg="danger">
-                              NOK: {result.extracted_data.checklist?.filter(i => i.nok).length || 0}
-                            </Badge>
-                          </Col>
-                        </Row>
-                      </div>
-                    </Collapse>
-                    
-                    <Button variant="success" size="lg" onClick={downloadResult}>
-                      📥 Скачать заполненный план
-                    </Button>
-                    
-                    {result.validation && (() => {
-                      const v = result.validation
-                      const issues = Array.isArray(v.issues) ? v.issues : []
-                      const notes = Array.isArray(v.notes) ? v.notes : []
-                      const isOk = v.valid && issues.length === 0
+                    {/* Скачивание результатов */}
+                    <div className="d-flex flex-wrap gap-2 align-items-center mb-3">
+                      {resultOutputs().map((o, idx) => (
+                        <Button key={idx} variant="success" size="lg" onClick={() => downloadByRef(o.output_file)}>
+                          📥 Скачать: {outputLabel(o)}
+                          {typeof o.ok_count === 'number' && (
+                            <span className="ms-2 small">
+                              (OK {o.ok_count} / NOK {o.nok_count}{o.manual_count ? ` / ручных ${o.manual_count}` : ''})
+                            </span>
+                          )}
+                        </Button>
+                      ))}
+                      {resultOutputs().length > 1 && sessionId && (
+                        <Button variant="outline-success" size="lg"
+                          onClick={() => window.open(`${API_BASE}/api/download-outputs/${sessionId}`, '_blank')}>
+                          🗜 Скачать оба (ZIP)
+                        </Button>
+                      )}
+                    </div>
+
+                    {/* Детальный результат по каждому чек-листу */}
+                    {resultOutputs().map((o, oi) => {
+                      const cl = o.checklist || (oi === 0 ? result.extracted_data?.checklist : null) || []
+                      const hdr = o.header || (oi === 0 ? result.extracted_data?.header : null)
+                      const v = o.validation || (oi === 0 ? result.validation : null)
+                      const notes = v && Array.isArray(v.notes) ? v.notes : []
+                      const issues = v && Array.isArray(v.issues) ? v.issues : []
                       return (
-                        <Card className={`mt-3 ${isOk ? 'border-success' : 'border-danger'}`}>
-                          <Card.Header className={isOk ? 'bg-success text-white' : 'bg-danger text-white'}>
-                            {isOk ? '✓ Результат валидации' : '✗ Результат валидации — есть проблемы'}
+                        <Card key={oi} className="mb-3">
+                          <Card.Header className="d-flex justify-content-between align-items-center">
+                            <span><strong>{outputLabel(o)}</strong>{o.checklist_file ? ` — ${o.checklist_file}` : ''}</span>
+                            <span>
+                              <Badge bg="success" className="me-1">OK {o.ok_count ?? cl.filter(i => i.ok).length}</Badge>
+                              <Badge bg="danger" className="me-1">NOK {o.nok_count ?? cl.filter(i => i.nok).length}</Badge>
+                              {(o.manual_count || cl.filter(i => !i.ok && !i.nok).length) > 0 && (
+                                <Badge bg="secondary">ручных {o.manual_count ?? cl.filter(i => !i.ok && !i.nok).length}</Badge>
+                              )}
+                            </span>
                           </Card.Header>
                           <Card.Body>
-                            <Row>
-                              <Col md={4}>
-                                <strong>Шапка:</strong> {v.header_filled || '—'}
-                              </Col>
-                              <Col md={4}>
-                                <strong>Чек-лист:</strong> {v.checklist_total || 0} строк
-                              </Col>
-                              <Col md={4}>
-                                <Badge bg="success" className="me-2">OK: {v.ok_count || 0}</Badge>
-                                <Badge bg="danger">NOK: {v.nok_count || 0}</Badge>
-                              </Col>
-                            </Row>
-                            {isOk ? (
-                              <Alert variant="success" className="mt-2 mb-0">
-                                ✓ Все пункты OK, замечаний нет
-                              </Alert>
-                            ) : (
+                            {hdr && Object.keys(hdr).length > 0 && (
+                              <Table striped size="sm" className="mb-3">
+                                <tbody>
+                                  {Object.entries(hdr).map(([key, value]) => (
+                                    <tr key={key}>
+                                      <td style={{ width: '40%' }}><strong>{key}</strong></td>
+                                      <td>{typeof value === 'string' ? value : JSON.stringify(value)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </Table>
+                            )}
+                            <Table striped size="sm" className="mb-2">
+                              <thead>
+                                <tr>
+                                  <th style={{ width: '5%' }}>#</th>
+                                  <th style={{ width: '12%' }}>Статус</th>
+                                  <th>Обоснование</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {cl.map((item, idx) => (
+                                  <tr key={idx}>
+                                    <td>{idx + 1}</td>
+                                    <td>
+                                      {item.nok ? (
+                                        <Badge bg="danger">☒ NOK</Badge>
+                                      ) : item.ok ? (
+                                        <Badge bg="success">☑ OK</Badge>
+                                      ) : (
+                                        <Badge bg="secondary">✋ Ручная</Badge>
+                                      )}
+                                    </td>
+                                    <td className={item.nok ? 'text-danger' : (!item.ok && !item.nok ? 'text-muted' : '')}>
+                                      {item.reason || item.problems || '—'}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </Table>
+                            {issues.length > 0 && (
                               <Alert variant="warning" className="mt-2 mb-0">
-                                <strong>Обнаружены проблемы:</strong>
-                                <ul className="mb-0">
-                                  {issues.length > 0
-                                    ? issues.map((issue, idx) => <li key={idx}>{issue}</li>)
-                                    : <li>Документ не прошёл валидацию (детали отсутствуют)</li>}
-                                </ul>
+                                <strong>Проблемы валидации:</strong>
+                                <ul className="mb-0">{issues.map((s, i) => <li key={i}>{s}</li>)}</ul>
                               </Alert>
                             )}
                             {notes.length > 0 && (
                               <Alert variant="info" className="mt-2 mb-0">
-                                <strong>Доп. примечания:</strong>
-                                <ul className="mb-0">
-                                  {notes.map((n, idx) => <li key={idx}>{n}</li>)}
-                                </ul>
+                                <strong>Примечания:</strong>
+                                <ul className="mb-0">{notes.map((s, i) => <li key={i}>{s}</li>)}</ul>
                               </Alert>
                             )}
                           </Card.Body>
                         </Card>
                       )
-                    })()}
+                    })}
                   </>
                 )}
               </Card.Body>
