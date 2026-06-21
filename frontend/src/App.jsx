@@ -94,9 +94,9 @@ function App() {
   const [availableModels, setAvailableModels] = useState(KNOWN_MODELS)
   const [diagnosing, setDiagnosing] = useState(false)
   const [diagnose, setDiagnose] = useState(null)
-  const [files, setFiles] = useState({ plan: null, plan2: null, planDoc: null, planDoc2: null, sources: [] })
-  const [uploadedFiles, setUploadedFiles] = useState({ plan: null, plan2: null, planDoc: null, planDoc2: null, sources: [] })
-  const [uploadProgress, setUploadProgress] = useState({ plan: null, plan2: null, planDoc: null, planDoc2: null, sources: null })
+  const [files, setFiles] = useState({ checklists: [], planDocs: [], sources: [] })
+  const [uploadedFiles, setUploadedFiles] = useState({ checklists: [], planDocs: [], sources: [] })
+  const [uploadProgress, setUploadProgress] = useState({ checklists: null, planDocs: null, sources: null })
   const [processing, setProcessing] = useState(false)
   const [progress, setProgress] = useState(null)
   const [result, setResult] = useState(null)
@@ -279,14 +279,9 @@ function App() {
 
   const handleFileChange = (type, e) => {
     const selectedFiles = Array.from(e.target.files)
-    if (type === 'plan') {
-      setFiles(prev => ({ ...prev, plan: selectedFiles[0] || null }))
-    } else if (type === 'plan2') {
-      setFiles(prev => ({ ...prev, plan2: selectedFiles[0] || null }))
-    } else if (type === 'planDoc') {
-      setFiles(prev => ({ ...prev, planDoc: selectedFiles[0] || null }))
-    } else if (type === 'planDoc2') {
-      setFiles(prev => ({ ...prev, planDoc2: selectedFiles[0] || null }))
+    if (type === 'checklists' || type === 'planDocs') {
+      // в этих полях максимум 2 файла
+      setFiles(prev => ({ ...prev, [type]: selectedFiles.slice(0, 2) }))
     } else if (type === 'sources') {
       setFiles(prev => ({ ...prev, sources: selectedFiles }))
     }
@@ -313,141 +308,62 @@ function App() {
     }
   }
 
-  const uploadPlanDoc = async () => {
-    if (!files.planDoc) {
-      setError('Выберите файл "План"')
+  // Универсальная загрузка набора файлов в одно поле.
+  // key — ключ в state (checklists | planDocs | sources); max — лимит файлов в поле.
+  const uploadMulti = async (key, fileType, block, max) => {
+    const sel = files[key] || []
+    if (sel.length === 0) {
+      setError('Выберите файлы')
       return
     }
     const formData = new FormData()
-    formData.append('files', files.planDoc)
-    formData.append('file_type', 'plan_doc')
-    formData.append('block', 'plan')
+    sel.forEach(f => formData.append('files', f))
+    formData.append('file_type', fileType)
+    formData.append('block', block)
     if (sessionId) formData.append('session_id', sessionId)
     try {
-      const res = await doUpload('planDoc', formData, 'Ошибка загрузки файла "План"')
-      if (res.data.session_id) setSessionId(res.data.session_id)
-      setUploadedFiles(prev => ({ ...prev, planDoc: res.data.uploaded_files[0] }))
-      setFiles(prev => ({ ...prev, planDoc: null }))
-    } catch (e) {}
-  }
-
-  const uploadPlan = async () => {
-    if (!files.plan) {
-      setError('Выберите файл Плана АУДИТА')
-      return
-    }
-    const formData = new FormData()
-    formData.append('files', files.plan)
-    formData.append('file_type', 'plan')
-    formData.append('block', 'checklist')
-    if (sessionId) formData.append('session_id', sessionId)
-    try {
-      const res = await doUpload('plan', formData, 'Ошибка загрузки плана')
-      if (res.data.session_id) setSessionId(res.data.session_id)
-      setUploadedFiles(prev => ({ ...prev, plan: res.data.uploaded_files[0] }))
-      setFiles(prev => ({ ...prev, plan: null }))
-    } catch (e) {}
-  }
-
-  const uploadPlanDoc2 = async () => {
-    if (!files.planDoc2) {
-      setError('Выберите второй проверяемый документ')
-      return
-    }
-    const formData = new FormData()
-    formData.append('files', files.planDoc2)
-    formData.append('file_type', 'plan_doc')
-    formData.append('block', 'plan')
-    if (sessionId) formData.append('session_id', sessionId)
-    try {
-      const res = await doUpload('planDoc2', formData, 'Ошибка загрузки второго проверяемого документа')
-      if (res.data.session_id) setSessionId(res.data.session_id)
-      setUploadedFiles(prev => ({ ...prev, planDoc2: res.data.uploaded_files[0] }))
-      setFiles(prev => ({ ...prev, planDoc2: null }))
-    } catch (e) {}
-  }
-
-  const uploadPlan2 = async () => {
-    if (!files.plan2) {
-      setError('Выберите второй чек-лист')
-      return
-    }
-    const formData = new FormData()
-    formData.append('files', files.plan2)
-    formData.append('file_type', 'plan')
-    formData.append('block', 'checklist')
-    if (sessionId) formData.append('session_id', sessionId)
-    try {
-      const res = await doUpload('plan2', formData, 'Ошибка загрузки второго чек-листа')
-      if (res.data.session_id) setSessionId(res.data.session_id)
-      setUploadedFiles(prev => ({ ...prev, plan2: res.data.uploaded_files[0] }))
-      setFiles(prev => ({ ...prev, plan2: null }))
-    } catch (e) {}
-  }
-
-  const uploadSources = async () => {
-    if (files.sources.length === 0) {
-      setError('Выберите файлы источников')
-      return
-    }
-    const formData = new FormData()
-    files.sources.forEach(file => formData.append('files', file))
-    formData.append('file_type', 'source')
-    formData.append('block', 'sources')
-    if (sessionId) formData.append('session_id', sessionId)
-    try {
-      const res = await doUpload('sources', formData, 'Ошибка загрузки источников')
+      const res = await doUpload(key, formData, 'Ошибка загрузки файлов')
       if (res.data.session_id) setSessionId(res.data.session_id)
       setUploadedFiles(prev => ({
         ...prev,
-        sources: [...prev.sources, ...res.data.uploaded_files]
+        [key]: [...prev[key], ...res.data.uploaded_files].slice(0, max)
       }))
-      setFiles(prev => ({ ...prev, sources: [] }))
+      setFiles(prev => ({ ...prev, [key]: [] }))
     } catch (e) {}
   }
 
+  const uploadChecklists = () => uploadMulti('checklists', 'plan', 'checklist', 2)
+  const uploadPlanDocs = () => uploadMulti('planDocs', 'plan_doc', 'plan', 2)
+  const uploadSources = () => uploadMulti('sources', 'source', 'sources', 999)
+
   const uploadFromPath = async (type) => {
-    const labels = { plan: 'Планом АУДИТА', sources: 'источниками' }
+    const labels = { checklists: 'чек-листами', sources: 'источниками' }
+    const max = { checklists: 2, sources: 999 }
     const path = prompt(`Введите путь к папке с ${labels[type]}:\n(например: D:\\Perpektiva\\Пакет 2):`)
     if (!path) return
 
     try {
       const formData = new FormData()
       formData.append('source_path', path)
-      formData.append('file_type', type)
-      formData.append('block', type === 'plan' ? 'checklist' : 'sources')
+      formData.append('file_type', type === 'checklists' ? 'plan' : 'source')
+      formData.append('block', type === 'checklists' ? 'checklist' : 'sources')
       if (sessionId) formData.append('session_id', sessionId)
       const res = await axios.post(`${API_BASE}/api/upload-from-path`, formData)
       if (res.data.session_id) setSessionId(res.data.session_id)
-
-      if (type === 'sources') {
-        setUploadedFiles(prev => ({ 
-          ...prev, 
-          sources: [...prev.sources, ...res.data.uploaded_files] 
-        }))
-      } else {
-        setUploadedFiles(prev => ({ ...prev, plan: res.data.uploaded_files[0] }))
-      }
+      setUploadedFiles(prev => ({
+        ...prev,
+        [type]: [...prev[type], ...res.data.uploaded_files].slice(0, max[type])
+      }))
     } catch (e) {
       setError('Ошибка загрузки из папки. Убедитесь, что путь существует.')
     }
   }
 
-  const removeFile = (type, index = null) => {
-    if (type === 'plan') {
-      setUploadedFiles(prev => ({ ...prev, plan: null }))
-    } else if (type === 'plan2') {
-      setUploadedFiles(prev => ({ ...prev, plan2: null }))
-    } else if (type === 'planDoc') {
-      setUploadedFiles(prev => ({ ...prev, planDoc: null }))
-    } else if (type === 'planDoc2') {
-      setUploadedFiles(prev => ({ ...prev, planDoc2: null }))
-    } else if (type === 'sources' && index !== null) {
-      setUploadedFiles(prev => ({
-        ...prev,
-        sources: prev.sources.filter((_, i) => i !== index)
-      }))
-    }
+  const removeFile = (type, index) => {
+    setUploadedFiles(prev => ({
+      ...prev,
+      [type]: prev[type].filter((_, i) => i !== index)
+    }))
   }
 
   const processDocuments = async () => {
@@ -455,12 +371,12 @@ function App() {
       setError('API ключ GigaChat не сохранён. Откройте «🔧 Админ» и сохраните ключ.')
       return
     }
-    if (!uploadedFiles.plan) {
-      setError('Загрузите чек-лист в поле 1 («План АУДИТА» или «Сводный акт»)')
+    if (uploadedFiles.checklists.length === 0) {
+      setError('Загрузите чек-лист(ы) в поле 1 («План АУДИТА» и/или «Сводный акт»)')
       return
     }
-    if (!uploadedFiles.planDoc) {
-      setError('Загрузите проверяемый документ в поле 2')
+    if (uploadedFiles.planDocs.length === 0) {
+      setError('Загрузите проверяемый документ(ы) в поле 2')
       return
     }
     if (uploadedFiles.sources.length === 0) {
@@ -481,19 +397,16 @@ function App() {
     setProcessing(true)
 
     try {
+      const nameOf = (f) => f.filename || f.name
+      const cks = uploadedFiles.checklists
+      const pds = uploadedFiles.planDocs
       const formData = new FormData()
       formData.append('api_key', apiKey)
-      formData.append('template_file', uploadedFiles.plan.filename || uploadedFiles.plan.name)
       formData.append('session_id', sessionId)
-      if (uploadedFiles.plan2) {
-        formData.append('template_file_2', uploadedFiles.plan2.filename || uploadedFiles.plan2.name)
-      }
-      if (uploadedFiles.planDoc) {
-        formData.append('plan_doc_file', uploadedFiles.planDoc.filename || uploadedFiles.planDoc.name)
-      }
-      if (uploadedFiles.planDoc2) {
-        formData.append('plan_doc_file_2', uploadedFiles.planDoc2.filename || uploadedFiles.planDoc2.name)
-      }
+      formData.append('template_file', nameOf(cks[0]))
+      if (cks[1]) formData.append('template_file_2', nameOf(cks[1]))
+      formData.append('plan_doc_file', nameOf(pds[0]))
+      if (pds[1]) formData.append('plan_doc_file_2', nameOf(pds[1]))
 
       const res = await axios.post(`${API_BASE}/api/process`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
@@ -570,8 +483,8 @@ function App() {
                 <li><strong>«ЧК -Сводный акт»</strong> — чек-лист для Сводного акта.</li>
               </ul>
               <p className="mb-0 small text-muted">
-                Нужны оба — первый в основное поле, второй через «Загрузить 2-й чек-лист». Нужен один — грузим
-                только его. Обработка идёт по очереди: сначала План, затем Сводный акт; на каждый — свой выходной файл.
+                Нужны оба — выберите сразу два файла в одном поле (до 2 шт.). Нужен один — грузите только его.
+                Обработка идёт по очереди: сначала План, затем Сводный акт; на каждый — свой выходной файл.
               </p>
             </Card.Body>
           </Card>
@@ -585,9 +498,9 @@ function App() {
                 <li>для ЧК «Сводный акт» — файл <strong>«Сводный акт исследования (итог)»</strong>.</li>
               </ul>
               <p className="mb-0 small text-muted">
-                Можно загрузить <strong>два</strong> документа (основное поле + «Загрузить 2-й документ»). Если работаете
-                сразу с двумя чек-листами — положите сюда и «План аудита», и «Сводный акт исследования»; система сама
-                сопоставит каждый со своим чек-листом.
+                Можно выбрать <strong>до 2 документов сразу</strong> в одном поле. Если работаете сразу с двумя
+                чек-листами — выберите и «План аудита», и «Сводный акт исследования»; система сама сопоставит
+                каждый со своим чек-листом.
               </p>
             </Card.Body>
           </Card>
@@ -816,72 +729,46 @@ function App() {
               📄 1. Чек-лист аудитора
             </Card.Header>
             <Card.Body className="d-flex flex-column">
-              <Form.Label className="text-muted small">Шаблон с пунктами проверки</Form.Label>
+              <Form.Label className="text-muted small">
+                Бланк(и) с пунктами проверки — «План АУДИТА» и/или «Сводный акт».
+                Можно выбрать <strong>до 2 файлов сразу</strong>; тип определяется автоматически.
+              </Form.Label>
               <Form.Control
                 type="file"
+                multiple
                 accept=".docx,.doc,.docm,.pdf,.xlsx"
-                onChange={(e) => handleFileChange('plan', e)}
+                onChange={(e) => handleFileChange('checklists', e)}
                 className="mb-2"
               />
               <div className="d-grid gap-2">
                 <Button
                   variant="primary"
                   size="sm"
-                  onClick={uploadPlan}
-                  disabled={!files.plan || uploadProgress.plan !== null}
+                  onClick={uploadChecklists}
+                  disabled={files.checklists.length === 0 || uploadProgress.checklists !== null}
                 >
-                  {uploadProgress.plan !== null ? 'Загрузка...' : 'Загрузить чек-лист'}
+                  {uploadProgress.checklists !== null ? 'Загрузка...' : `Загрузить чек-лист(ы)${files.checklists.length ? ` (${files.checklists.length})` : ''}`}
                 </Button>
                 <Button
                   variant="outline-primary"
                   size="sm"
-                  onClick={() => uploadFromPath('plan')}
-                  disabled={uploadProgress.plan !== null}
+                  onClick={() => uploadFromPath('checklists')}
+                  disabled={uploadProgress.checklists !== null}
                 >
                   Из папки
                 </Button>
               </div>
-              {uploadProgress.plan !== null && (
-                <ProgressBar now={uploadProgress.plan} label={`${uploadProgress.plan}%`} animated className="mt-2" />
+              {uploadProgress.checklists !== null && (
+                <ProgressBar now={uploadProgress.checklists} label={`${uploadProgress.checklists}%`} animated className="mt-2" />
               )}
-              {uploadedFiles.plan && (
+              {uploadedFiles.checklists.length > 0 && (
                 <div className="mt-3">
-                  <Badge bg="primary" className="me-2 mb-2 d-inline-flex align-items-center">
-                    {uploadedFiles.plan.filename || uploadedFiles.plan.name}
-                    <button className="btn-close btn-close-white ms-2" style={{ fontSize: '0.6rem' }} onClick={() => removeFile('plan')} />
-                  </Badge>
-                </div>
-              )}
-
-              <hr className="my-2" />
-              <Form.Label className="text-muted small">
-                Второй чек-лист (опционально) — например «ЧК -Сводный акт». Тип определяется автоматически.
-              </Form.Label>
-              <Form.Control
-                type="file"
-                accept=".docx,.doc,.docm,.pdf,.xlsx"
-                onChange={(e) => handleFileChange('plan2', e)}
-                className="mb-2"
-              />
-              <div className="d-grid">
-                <Button
-                  variant="outline-primary"
-                  size="sm"
-                  onClick={uploadPlan2}
-                  disabled={!files.plan2 || uploadProgress.plan2 !== null}
-                >
-                  {uploadProgress.plan2 !== null ? 'Загрузка...' : 'Загрузить 2-й чек-лист'}
-                </Button>
-              </div>
-              {uploadProgress.plan2 !== null && (
-                <ProgressBar now={uploadProgress.plan2} label={`${uploadProgress.plan2}%`} animated className="mt-2" />
-              )}
-              {uploadedFiles.plan2 && (
-                <div className="mt-3">
-                  <Badge bg="primary" className="me-2 mb-2 d-inline-flex align-items-center">
-                    {uploadedFiles.plan2.filename || uploadedFiles.plan2.name}
-                    <button className="btn-close btn-close-white ms-2" style={{ fontSize: '0.6rem' }} onClick={() => removeFile('plan2')} />
-                  </Badge>
+                  {uploadedFiles.checklists.map((f, idx) => (
+                    <Badge key={idx} bg="primary" className="me-2 mb-2 d-inline-flex align-items-center">
+                      {f.filename || f.name}
+                      <button className="btn-close btn-close-white ms-2" style={{ fontSize: '0.6rem' }} onClick={() => removeFile('checklists', idx)} />
+                    </Badge>
+                  ))}
                 </div>
               )}
             </Card.Body>
@@ -898,65 +785,36 @@ function App() {
                 Главный проверяемый документ: <strong>План аудита</strong> (для ЧК «План АУДИТА») —
                 пункты «Цель и область», «Основание», «Сроки», «Состав ЭГ»; либо
                 <strong> Сводный акт исследования (итог)</strong> (для ЧК «Сводный акт»).
-                Если грузите оба чек-листа — добавьте оба проверяемых документа (тип определяется автоматически).
+                Можно выбрать <strong>до 2 файлов сразу</strong>; система сама сопоставит их с чек-листами.
               </Form.Label>
               <Form.Control
                 type="file"
+                multiple
                 accept=".docx,.doc,.docm,.pdf,.xlsx"
-                onChange={(e) => handleFileChange('planDoc', e)}
+                onChange={(e) => handleFileChange('planDocs', e)}
                 className="mb-2"
               />
               <div className="d-grid gap-2">
                 <Button
                   variant="info"
                   size="sm"
-                  onClick={uploadPlanDoc}
-                  disabled={!files.planDoc || uploadProgress.planDoc !== null}
+                  onClick={uploadPlanDocs}
+                  disabled={files.planDocs.length === 0 || uploadProgress.planDocs !== null}
                 >
-                  {uploadProgress.planDoc !== null ? 'Загрузка...' : 'Загрузить документ'}
+                  {uploadProgress.planDocs !== null ? 'Загрузка...' : `Загрузить документ(ы)${files.planDocs.length ? ` (${files.planDocs.length})` : ''}`}
                 </Button>
               </div>
-              {uploadProgress.planDoc !== null && (
-                <ProgressBar now={uploadProgress.planDoc} label={`${uploadProgress.planDoc}%`} animated variant="info" className="mt-2" />
+              {uploadProgress.planDocs !== null && (
+                <ProgressBar now={uploadProgress.planDocs} label={`${uploadProgress.planDocs}%`} animated variant="info" className="mt-2" />
               )}
-              {uploadedFiles.planDoc && (
+              {uploadedFiles.planDocs.length > 0 && (
                 <div className="mt-3">
-                  <Badge bg="info" className="me-2 mb-2 d-inline-flex align-items-center">
-                    {uploadedFiles.planDoc.filename || uploadedFiles.planDoc.name}
-                    <button className="btn-close btn-close-white ms-2" style={{ fontSize: '0.6rem' }} onClick={() => removeFile('planDoc')} />
-                  </Badge>
-                </div>
-              )}
-
-              <hr className="my-2" />
-              <Form.Label className="text-muted small">
-                Второй проверяемый документ (опционально) — например «Сводный акт исследования (итог)».
-              </Form.Label>
-              <Form.Control
-                type="file"
-                accept=".docx,.doc,.docm,.pdf,.xlsx"
-                onChange={(e) => handleFileChange('planDoc2', e)}
-                className="mb-2"
-              />
-              <div className="d-grid">
-                <Button
-                  variant="outline-info"
-                  size="sm"
-                  onClick={uploadPlanDoc2}
-                  disabled={!files.planDoc2 || uploadProgress.planDoc2 !== null}
-                >
-                  {uploadProgress.planDoc2 !== null ? 'Загрузка...' : 'Загрузить 2-й документ'}
-                </Button>
-              </div>
-              {uploadProgress.planDoc2 !== null && (
-                <ProgressBar now={uploadProgress.planDoc2} label={`${uploadProgress.planDoc2}%`} animated variant="info" className="mt-2" />
-              )}
-              {uploadedFiles.planDoc2 && (
-                <div className="mt-3">
-                  <Badge bg="info" className="me-2 mb-2 d-inline-flex align-items-center">
-                    {uploadedFiles.planDoc2.filename || uploadedFiles.planDoc2.name}
-                    <button className="btn-close btn-close-white ms-2" style={{ fontSize: '0.6rem' }} onClick={() => removeFile('planDoc2')} />
-                  </Badge>
+                  {uploadedFiles.planDocs.map((f, idx) => (
+                    <Badge key={idx} bg="info" className="me-2 mb-2 d-inline-flex align-items-center">
+                      {f.filename || f.name}
+                      <button className="btn-close btn-close-white ms-2" style={{ fontSize: '0.6rem' }} onClick={() => removeFile('planDocs', idx)} />
+                    </Badge>
+                  ))}
                 </div>
               )}
             </Card.Body>
@@ -1035,24 +893,22 @@ function App() {
               <Row>
                 <Col md={4}>
                   <strong>Чек-лист(ы):</strong>{' '}
-                  {uploadedFiles.plan ? (
-                    <Badge bg="primary" className="me-1">{uploadedFiles.plan.filename || uploadedFiles.plan.name}</Badge>
+                  {uploadedFiles.checklists.length > 0 ? (
+                    uploadedFiles.checklists.map((f, i) => (
+                      <Badge key={i} bg="primary" className="me-1">{f.filename || f.name}</Badge>
+                    ))
                   ) : (
                     <span className="text-muted">не загружен</span>
-                  )}
-                  {uploadedFiles.plan2 && (
-                    <Badge bg="primary">{uploadedFiles.plan2.filename || uploadedFiles.plan2.name}</Badge>
                   )}
                 </Col>
                 <Col md={4}>
                   <strong>Проверяемый документ:</strong>{' '}
-                  {uploadedFiles.planDoc ? (
-                    <Badge bg="info" className="me-1">{uploadedFiles.planDoc.filename || uploadedFiles.planDoc.name}</Badge>
+                  {uploadedFiles.planDocs.length > 0 ? (
+                    uploadedFiles.planDocs.map((f, i) => (
+                      <Badge key={i} bg="info" className="me-1">{f.filename || f.name}</Badge>
+                    ))
                   ) : (
                     <span className="text-muted">не загружен</span>
-                  )}
-                  {uploadedFiles.planDoc2 && (
-                    <Badge bg="info">{uploadedFiles.planDoc2.filename || uploadedFiles.planDoc2.name}</Badge>
                   )}
                 </Col>
                 <Col md={4}>
@@ -1070,7 +926,7 @@ function App() {
                 variant="primary"
                 size="lg"
                 onClick={processDocuments}
-                disabled={processing || !uploadedFiles.plan || uploadedFiles.sources.length === 0}
+                disabled={processing || uploadedFiles.checklists.length === 0 || uploadedFiles.planDocs.length === 0 || uploadedFiles.sources.length === 0}
               >
                 {processing ? (
                   <>
