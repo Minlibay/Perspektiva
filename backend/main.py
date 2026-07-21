@@ -110,6 +110,15 @@ def _list_session_files(sdir: Path) -> list[dict]:
 # с фолбэком на это значение, если в настройках поле пустое.
 DEFAULT_GIGACHAT_MODEL = "GigaChat-2-Pro"
 
+# OAuth scope GigaChat зависит от типа аккаунта, на который выпущен ключ:
+#   "GIGACHAT_API_PERS" — физическое лицо;
+#   "GIGACHAT_API_B2B"  — юр.лицо / ИП, предоплатные пакеты токенов;
+#   "GIGACHAT_API_CORP" — юр.лицо / ИП, оплата по факту (pay-as-you-go).
+# При смене аккаунта с физлица на организацию scope ОБЯЗАТЕЛЬНО менять,
+# иначе OAuth вернёт ошибку авторизации. Реальное значение берётся из
+# gigachat_settings.json (поле "scope"), с фолбэком на это значение.
+DEFAULT_GIGACHAT_SCOPE = "GIGACHAT_API_CORP"
+
 
 def _load_settings() -> dict:
     """Прочитать gigachat_settings.json. Возвращает {} если нет или битый."""
@@ -127,6 +136,11 @@ def _get_active_model() -> str:
     """Активная модель: из настроек, иначе DEFAULT_GIGACHAT_MODEL."""
     return (_load_settings().get("model") or "").strip() or DEFAULT_GIGACHAT_MODEL
 
+
+def _get_active_scope() -> str:
+    """Активный OAuth scope: из настроек, иначе DEFAULT_GIGACHAT_SCOPE."""
+    return (_load_settings().get("scope") or "").strip() or DEFAULT_GIGACHAT_SCOPE
+
 # Глобальный статус обработки — для опроса прогресса из UI
 processing_status = {
     "stage": "idle",        # idle | header | verify | done | error
@@ -141,6 +155,7 @@ class GigaChatSettings(BaseModel):
     """Настройки подключения к GigaChat"""
     api_key: str
     model: Optional[str] = None
+    scope: Optional[str] = None
 
 
 class ProcessingResult(BaseModel):
@@ -874,23 +889,26 @@ def fill_plan_with_checklist(template_path: str, extracted_data: dict, output_pa
     return output_path
 
 
-def gigachat_preflight(api_key: str, timeout: float = 8.0, model: Optional[str] = None) -> dict:
+def gigachat_preflight(api_key: str, timeout: float = 8.0, model: Optional[str] = None,
+                       scope: Optional[str] = None) -> dict:
     """
     Быстрая диагностика доступности GigaChat.
     Шаги:
       1. OAuth-запрос на порт 9443 (ngw.devices.sberbank.ru)
       2. Запрос списка моделей на порт 443 (gigachat.devices.sberbank.ru)
-    Возвращает: {ok, stage, detail, models, current_model}.
+    Возвращает: {ok, stage, detail, models, current_model, scope}.
     """
     import uuid
     active_model = (model or "").strip() or DEFAULT_GIGACHAT_MODEL
+    active_scope = (scope or "").strip() or _get_active_scope()
     try:
         import httpx
     except ImportError:
         return {"ok": False, "stage": "no_httpx", "detail": "httpx не установлен",
-                "models": [], "current_model": active_model}
+                "models": [], "current_model": active_model, "scope": active_scope}
 
-    result = {"ok": False, "stage": "", "detail": "", "models": [], "current_model": active_model}
+    result = {"ok": False, "stage": "", "detail": "", "models": [],
+              "current_model": active_model, "scope": active_scope}
 
     # Шаг 1: OAuth
     try:
@@ -901,7 +919,7 @@ def gigachat_preflight(api_key: str, timeout: float = 8.0, model: Optional[str] 
                 "RqUID": str(uuid.uuid4()),
                 "Content-Type": "application/x-www-form-urlencoded",
             },
-            data={"scope": "GIGACHAT_API_PERS"},
+            data={"scope": active_scope},
             timeout=timeout,
             verify=False,
         )
@@ -922,7 +940,12 @@ def gigachat_preflight(api_key: str, timeout: float = 8.0, model: Optional[str] 
 
     if resp.status_code == 401:
         result["stage"] = "oauth_unauthorized"
-        result["detail"] = "Ключ отклонён (HTTP 401). Проверьте корректность авторизационных данных."
+        result["detail"] = (
+            f"Ключ отклонён (HTTP 401) при scope '{active_scope}'. "
+            "Проверьте корректность авторизационных данных и что scope соответствует типу "
+            "аккаунта: физлицо — GIGACHAT_API_PERS; организация/ИП — GIGACHAT_API_B2B "
+            "(предоплата) или GIGACHAT_API_CORP (оплата по факту)."
+        )
         return result
     if resp.status_code >= 400:
         result["stage"] = "oauth_http_error"
@@ -980,15 +1003,16 @@ def gigachat_preflight(api_key: str, timeout: float = 8.0, model: Optional[str] 
 
 def _gigachat_call(api_key: str, system_prompt: str, user_prompt: str,
                    model: str = "GigaChat", temperature: float = 0.0,
-                   max_tokens: int = 2000) -> str:
+                   max_tokens: int = 2000, scope: Optional[str] = None) -> str:
     """Один вызов GigaChat с retry до 3 попыток."""
     import time
     from gigachat import GigaChat
 
+    scope = (scope or "").strip() or _get_active_scope()
     last_err = None
     for attempt in range(3):
         try:
-            gc = GigaChat(credentials=api_key, verify_ssl_certs=False)
+            gc = GigaChat(credentials=api_key, scope=scope, verify_ssl_certs=False)
             response = gc.chat({
                 "model": model,
                 "messages": [
@@ -4184,6 +4208,8 @@ async def save_gigachat_settings(settings: GigaChatSettings):
     existing["api_key"] = settings.api_key
     if settings.model is not None:
         existing["model"] = settings.model.strip()
+    if settings.scope is not None:
+        existing["scope"] = settings.scope.strip()
     with open(settings_file, "w", encoding="utf-8") as f:
         json.dump(existing, f, ensure_ascii=False, indent=2)
     return {"status": "ok", "message": "Настройки сохранены"}
@@ -4197,6 +4223,8 @@ async def get_gigachat_settings():
         "api_key": settings.get("api_key", ""),
         "model": settings.get("model", "") or DEFAULT_GIGACHAT_MODEL,
         "default_model": DEFAULT_GIGACHAT_MODEL,
+        "scope": settings.get("scope", "") or DEFAULT_GIGACHAT_SCOPE,
+        "default_scope": DEFAULT_GIGACHAT_SCOPE,
     }
 
 
@@ -4456,6 +4484,7 @@ async def process_documents(
 
     # Активная модель из настроек (с фолбэком на дефолт)
     active_model = _get_active_model()
+    active_scope = _get_active_scope()
 
     # Pre-flight: быстрая проверка GigaChat. Если auth/связь упали — ошибаемся сразу.
     processing_status.update({
@@ -4466,7 +4495,7 @@ async def process_documents(
         "detail": "",
     })
     print("Preflight GigaChat...")
-    preflight = await asyncio.to_thread(gigachat_preflight, api_key, 8.0, active_model)
+    preflight = await asyncio.to_thread(gigachat_preflight, api_key, 8.0, active_model, active_scope)
     if not preflight["ok"]:
         raise HTTPException(
             status_code=503,
@@ -4971,11 +5000,12 @@ def diagnose_gigachat():
     settings = _load_settings()
     key = settings.get("api_key", "")
     active_model = _get_active_model()
+    active_scope = _get_active_scope()
     if not key:
         return {"ok": False, "stage": "no_key",
                 "detail": "API ключ не сохранён. Сначала сохраните ключ в настройках.",
-                "models": [], "current_model": active_model}
-    return gigachat_preflight(key, timeout=8.0, model=active_model)
+                "models": [], "current_model": active_model, "scope": active_scope}
+    return gigachat_preflight(key, timeout=8.0, model=active_model, scope=active_scope)
 
 
 if __name__ == "__main__":

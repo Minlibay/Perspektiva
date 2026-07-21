@@ -85,12 +85,20 @@ const KNOWN_MODELS = [
   'GigaChat-2-Max',
 ]
 
+// OAuth scope зависит от типа аккаунта, на который выпущен ключ.
+const KNOWN_SCOPES = [
+  { value: 'GIGACHAT_API_PERS', label: 'PERS — физлицо' },
+  { value: 'GIGACHAT_API_B2B', label: 'B2B — организация/ИП (предоплата)' },
+  { value: 'GIGACHAT_API_CORP', label: 'CORP — организация/ИП (по факту)' },
+]
+
 function App() {
   const [apiKey, setApiKey] = useState('')
   const [apiKeySaved, setApiKeySaved] = useState(false)
   const [saveSuccess, setSaveSuccess] = useState(false)
   const [model, setModel] = useState('')
   const [defaultModel, setDefaultModel] = useState('')
+  const [scope, setScope] = useState('')
   const [availableModels, setAvailableModels] = useState(KNOWN_MODELS)
   const [diagnosing, setDiagnosing] = useState(false)
   const [diagnose, setDiagnose] = useState(null)
@@ -230,6 +238,7 @@ function App() {
           prev.includes(res.data.model) ? prev : [...prev, res.data.model]
         )
       }
+      if (res.data.scope) setScope(res.data.scope)
     } catch (e) {
       console.error('Ошибка загрузки настроек:', e)
     }
@@ -266,6 +275,7 @@ function App() {
       await axios.post(`${API_BASE}/api/settings/gigachat`, {
         api_key: apiKey.trim(),
         model: (model || '').trim(),
+        scope: (scope || '').trim(),
       })
       setApiKeySaved(true)
       setError(null)
@@ -603,6 +613,29 @@ function App() {
                     '🔍 Диагностика'
                   )}
                 </Button>
+              </Col>
+            </Row>
+            <Row className="g-2 align-items-center mt-1">
+              <Col md={5}>
+                <Form.Label className="small text-muted mb-1">
+                  Тип аккаунта (OAuth scope)
+                </Form.Label>
+                <Form.Select
+                  value={scope || ''}
+                  onChange={(e) => { setScope(e.target.value); setApiKeySaved(false); setSaveSuccess(false) }}
+                >
+                  <option value="">— по умолчанию —</option>
+                  {KNOWN_SCOPES.map((s) => (
+                    <option key={s.value} value={s.value}>{s.label}</option>
+                  ))}
+                </Form.Select>
+              </Col>
+              <Col md={7}>
+                <Form.Label className="small text-muted mb-1">&nbsp;</Form.Label>
+                <div className="small text-muted">
+                  Физлицо — PERS; организация/ИП — B2B (предоплата) или CORP (оплата по факту).
+                  Должен совпадать с типом аккаунта, на который выпущен ключ.
+                </div>
               </Col>
             </Row>
             {saveSuccess && (

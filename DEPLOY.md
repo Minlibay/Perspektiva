@@ -30,9 +30,20 @@ scp -r ./Web user@SERVER_IP:/opt/audit-app
 
 На сервере положить корректный `backend/gigachat_settings.json` вида:
 ```json
-{ "api_key": "ВАШ_КЛЮЧ", "model": "GigaChat" }
+{ "api_key": "ВАШ_КЛЮЧ", "model": "GigaChat", "scope": "GIGACHAT_API_CORP" }
 ```
 Файл монтируется в контейнер как volume — его правки переживают пересборку и рестарт.
+
+**`scope` зависит от типа аккаунта, на который выпущен ключ:**
+- `GIGACHAT_API_PERS` — физическое лицо;
+- `GIGACHAT_API_B2B` — юр.лицо / ИП, предоплатные пакеты токенов;
+- `GIGACHAT_API_CORP` — юр.лицо / ИП, оплата по факту (pay-as-you-go).
+
+При смене аккаунта с физлица на организацию нужно и заменить `api_key` на ключ из
+нового проекта организации, и выставить корректный `scope` (иначе OAuth вернёт HTTP 401).
+Если поле `scope` не задано — используется значение по умолчанию `GIGACHAT_API_CORP`
+(константа `DEFAULT_GIGACHAT_SCOPE` в `main.py`). Scope также можно выбрать в UI
+(раздел «Настройки GigaChat API» → «Тип аккаунта»).
 
 ## 4. Сборка и запуск
 
