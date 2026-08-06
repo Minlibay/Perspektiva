@@ -25,7 +25,14 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_RETRIES=10
 
 COPY requirements.txt .
-RUN if [ -n "$PIP_TRUSTED_HOST" ]; then \
+# vendor/ — заранее скачанные .whl для офлайн-сборки (когда сервер не видит pypi.org).
+# Если каталог непустой — ставим только из него, в сеть не ходим вообще.
+# Пустой (только .gitkeep) — обычная установка из индекса.
+COPY vendor ./vendor
+RUN if [ -n "$(ls -A vendor 2>/dev/null | grep -v '^\.gitkeep$')" ]; then \
+        echo ">>> Офлайн-установка из vendor/" && \
+        pip install --no-index --find-links=vendor -r requirements.txt; \
+    elif [ -n "$PIP_TRUSTED_HOST" ]; then \
         pip install --trusted-host "$PIP_TRUSTED_HOST" -r requirements.txt; \
     else \
         pip install -r requirements.txt; \

@@ -90,10 +90,43 @@ docker compose build --build-arg PIP_INDEX_URL=https://<зеркало>/simple b
 на `https://<зеркало>/simple/fastapi/`. Для зеркала без валидного TLS-сертификата
 добавьте `--build-arg PIP_TRUSTED_HOST=<хост>`.
 
-**Шаг 3. Если внешний доступ закрыт полностью** — собрать образ на машине с интернетом
-и перенести:
+**Шаг 3. Офлайн-сборка из `backend/vendor/` (основной вариант, когда pypi недоступен).**
+
+В репозитории лежит каталог `backend/vendor/` с заранее скачанными `.whl` под Linux/py3.11.
+Если он непустой, Dockerfile ставит зависимости **только из него**, в сеть не обращаясь:
+
 ```bash
-docker compose build backend           # там, где интернет есть
+git pull
+docker compose build backend
+docker compose up -d
+```
+
+В логе сборки при этом видно `>>> Офлайн-установка из vendor/`.
+
+Как обновить `vendor/` (делается на машине с интернетом, при смене `requirements.txt`):
+
+```bash
+cd backend
+docker run --rm -v "$PWD:/w" -w /w python:3.11-slim pip download -r requirements.txt -d vendor
+```
+
+Скачивание внутри контейнера гарантирует правильные Linux-сборки. Если Docker
+недоступен, тот же результат обычным pip — с явным указанием платформы:
+
+```bash
+pip download -r requirements.txt -d vendor --only-binary=:all: \
+  --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
+  --platform manylinux_2_28_x86_64 --platform any --python-version 3.11
+```
+
+**Важно:** нужны именно `.whl`. Файлы `.tar.gz` (исходники) офлайн не ставятся —
+для сборки они тянут build-backend из сети. И нельзя качать без `--platform` на
+Windows/macOS: приедут сборки под чужую ОС, на сервере они не заработают.
+Проверить каталог: `ls vendor/*.whl | grep -viE 'manylinux|none-any'` — вывод должен быть пустым.
+
+**Шаг 4. Крайний вариант** — собрать образ там, где интернет есть, и перенести целиком:
+```bash
+docker compose build backend
 docker save audit-backend | gzip > backend.tar.gz
 scp backend.tar.gz user@SERVER_IP:/opt/audit-app/
 # на сервере:
