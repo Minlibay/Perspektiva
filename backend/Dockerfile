@@ -15,8 +15,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
+# Индекс пакетов можно подменить на зеркало, если pypi.org недоступен/медленный:
+#   docker compose build --build-arg PIP_INDEX_URL=https://<зеркало>/simple
+# Таймаут и число повторов подняты: дефолтные 15 с рвут соединение на медленном канале.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_TRUSTED_HOST=""
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
+
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN if [ -n "$PIP_TRUSTED_HOST" ]; then \
+        pip install --trusted-host "$PIP_TRUSTED_HOST" -r requirements.txt; \
+    else \
+        pip install -r requirements.txt; \
+    fi
 
 COPY . .
 

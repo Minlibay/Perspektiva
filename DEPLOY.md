@@ -65,6 +65,45 @@ docker compose build
 docker compose up -d
 ```
 
+## 5.1. Если сборка падает на `pip install` (таймаут pypi.org)
+
+Симптом:
+```
+ReadTimeoutError("HTTPSConnectionPool(host='pypi.org', port=443): Read timed out. (read timeout=15)")
+```
+
+Если шаг `apt-get install` при этом прошёл — сеть на сервере в целом работает,
+проблема именно в доступе к pypi.org (медленный канал или блокировка).
+
+**Шаг 1. Проверить доступность с сервера:**
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' --max-time 30 https://pypi.org/simple/fastapi/
+```
+- `200` и время < 5 с — канал живой, помогает просто увеличенный таймаут (уже в Dockerfile: 120 с, 10 повторов). Повторите `docker compose build`.
+- таймаут / другой код — переходите к шагу 2.
+
+**Шаг 2. Собрать через зеркало.** Индекс вынесен в build-arg:
+```bash
+docker compose build --build-arg PIP_INDEX_URL=https://<зеркало>/simple backend
+```
+Зеркало сначала проверьте тем же `curl` с сервера — рабочее должно отдавать `200`
+на `https://<зеркало>/simple/fastapi/`. Для зеркала без валидного TLS-сертификата
+добавьте `--build-arg PIP_TRUSTED_HOST=<хост>`.
+
+**Шаг 3. Если внешний доступ закрыт полностью** — собрать образ на машине с интернетом
+и перенести:
+```bash
+docker compose build backend           # там, где интернет есть
+docker save audit-backend | gzip > backend.tar.gz
+scp backend.tar.gz user@SERVER_IP:/opt/audit-app/
+# на сервере:
+gunzip -c backend.tar.gz | docker load
+docker compose up -d
+```
+
+Слой с `pip install` кэшируется: пока `requirements.txt` не меняется, повторные
+сборки не ходят в сеть.
+
 ## 6. Останов / диагностика
 
 ```bash
