@@ -3000,6 +3000,36 @@ def _count_plan_experts(plan_raw: str) -> int:
     return count
 
 
+def _find_audit_period(text: str) -> Optional[str]:
+    """Период проведения аудита из текста, в каноническом виде «20-23.07.26».
+
+    ПЕРИОДОМ считается только ДИАПАЗОН дат. Одиночная дата намеренно
+    игнорируется: в Приказе об ЭГ единственная дата — это дата издания приказа
+    («ПРИКАЗ № П/03-07/01 03 июля 2026 г.»), и модель регулярно принимает её за
+    дату начала аудита, выдавая ложное расхождение со сроками из Плана.
+    """
+    if not text:
+        return None
+
+    def _yy(y: str) -> str:
+        return y[-2:]
+
+    # «20-23.07.26» / «20 – 23.07.2026»
+    m = re.search(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\.(\d{1,2})\.(\d{2,4})", text)
+    if m:
+        return f"{int(m.group(1)):02d}-{int(m.group(2)):02d}.{int(m.group(3)):02d}.{_yy(m.group(4))}"
+
+    # «20.07.26 - 23.07.26» / «с 20.07.2026 по 23.07.2026»
+    m = re.search(
+        r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})\s*(?:[-–—]|по)\s*(\d{1,2})\.(\d{1,2})\.(\d{2,4})",
+        text,
+    )
+    if m:
+        return f"{int(m.group(1)):02d}-{int(m.group(4)):02d}.{int(m.group(2)):02d}.{_yy(m.group(3))}"
+
+    return None
+
+
 def _norm_proc(s: str) -> str:
     """Нормализация названия процесса для сверки (регистр, ё, пробелы)."""
     return re.sub(r"\s+", " ", (s or "").lower().replace("ё", "е")).strip()
@@ -3717,6 +3747,54 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                             f"[авто-OK: исключения в Плане — {', '.join(found_pts)}, все легитимны "
                             f"(7.1.3.5/7.1.4.3 с пометкой «1 абзац»).]"
                         )
+
+            # Пункт 8 (idx=7): сроки аудита. Сверяем детерминированно — модель
+            # принимает дату ИЗДАНИЯ Приказа об ЭГ («ПРИКАЗ № П/03-07/01 03 июля
+            # 2026 г.») за дату начала аудита и выдаёт ложное расхождение со
+            # сроками Плана. Периодом считается только диапазон дат, одиночная
+            # дата в шапке документа — нет (см. _find_audit_period).
+            if idx == 7 and plan_raw:
+                plan_period = None
+                i_sr = plan_raw.find("Сроки проведения")
+                if i_sr >= 0:
+                    plan_period = _find_audit_period(plan_raw[i_sr: i_sr + 300])
+
+                if plan_period:
+                    conflicting, agreeing = [], []
+                    for f in relevant:
+                        if "план" in f.lower():
+                            continue  # сам План — не сторонний источник
+                        per = _find_audit_period(all_texts.get(f, ""))
+                        if not per:
+                            continue
+                        (agreeing if per == plan_period else conflicting).append(f"{f}: {per}")
+
+                    if conflicting:
+                        verdict["ok"] = False
+                        verdict["nok"] = True
+                        verdict["reason"] = (
+                            f"Сроки аудита в Плане ({plan_period}) противоречат стороннему "
+                            f"источнику: {'; '.join(conflicting)}."
+                        )
+                    elif agreeing:
+                        verdict["ok"] = True
+                        verdict["nok"] = False
+                        verdict["reason"] = (
+                            f"Сроки аудита в Плане ({plan_period}) подтверждены источником: "
+                            f"{'; '.join(agreeing)}."
+                        )
+                    else:
+                        verdict["ok"] = True
+                        verdict["nok"] = False
+                        verdict["reason"] = (
+                            f"Сроки аудита ({plan_period}) указаны только в Плане; ни один "
+                            f"сторонний источник периода проведения не содержит — "
+                            f"противоречий нет."
+                        )
+                    print(
+                        f"[item 8 dates] план={plan_period} совпало={len(agreeing)} "
+                        f"противоречит={len(conflicting)}"
+                    )
 
             # Пункт 14 (idx=13): процессы СМК из Акта предыдущего аудита должны
             # присутствовать в Плане. Считаем детерминированно: процессы в Плане
