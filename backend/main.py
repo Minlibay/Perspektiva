@@ -2254,13 +2254,17 @@ ITEM_RULES = {
             "ИЗ ФАЙЛА «Расчёт трудоёмкости» возьми строку, соответствующую виду аудита из Плана "
             "(Первый/Второй инспекционный контроль, Ресертификационный, Первый/Второй этап "
             "первичной сертификации и т.п.). В этой строке обычно два значения чел.-дней: "
-            "«Вне территории Заказчика» и «На территории Заказчика». R_total = их сумма.\n\n"
+            "«Вне территории Заказчика» и «На территории Заказчика». R_total = ТОЛЬКО значение "
+            "«На территории Заказчика». «Вне территории» (документарная экспертиза) в график "
+            "аудита на площадке не входит и в R_total НЕ включается — приведи её справочно.\n\n"
             "ИЗ ПЛАНА:\n"
             "  P_days = число дней в графике (раздел «Сроки проведения», диапазон).\n"
+            "  P_hours = суммарная продолжительность графика по дням за вычетом перерывов.\n"
             "  P_experts = число членов экспертной группы (раздел «Состав ЭГ»: руководитель + "
             "  эксперты + технические эксперты + кандидаты + наблюдатели — все непустые).\n"
-            "  P_total = P_days × P_experts.\n\n"
-            "В reason приведи все числа: R_total (с разбивкой на вне/на территории), P_days, "
+            "  P_total = (P_hours / 8) × P_experts. Аудитодень = 8 часов, поэтому день графика "
+            "  09:00–18:30 с получасовым перерывом = 9 ч = 1,125 аудитодня, а не 1.\n\n"
+            "В reason приведи все числа: R_total (и справочно «вне территории»), P_days, P_hours, "
             "P_experts, P_total. Сравни R_total и P_total. Если расходятся — NOK с конкретными "
             "числами; если совпадают — OK. extracted_values НЕ заполняй (вердикт всё равно "
             "детерминированный)."
@@ -2857,6 +2861,106 @@ SVOD_ITEM_RULES = {
 }
 
 
+_AUDIT_DAY_HOURS = 8.0
+
+
+def _plan_onsite_audit_days(plan_raw: str, hours_per_day: float = _AUDIT_DAY_HOURS) -> Optional[float]:
+    """Фактическая трудоёмкость по ГРАФИКУ Плана, в аудитоднях (на одного эксперта).
+
+    Календарное число дней («20-23.07.26» = 4) — грубая оценка: рабочий день в графике
+    обычно длиннее нормативных 8 часов, поэтому 4 календарных дня могут давать 4,5
+    аудитодня. Считаем честно: для каждого дня графика («N-й день. ДД.ММ.ГГ») берём
+    интервал от самого раннего начала до самого позднего окончания, вычитаем явно
+    обозначенные перерывы, суммируем и делим на норматив аудитодня (8 ч).
+
+    Возвращает None, если график не распознан (тогда вызывающий код откатывается
+    на старую оценку «календарные дни × эксперты»).
+    """
+    if not plan_raw:
+        return None
+
+    parts = re.split(r"\d+-й\s+день\.", plan_raw)
+    if len(parts) < 2:
+        return None
+
+    def _mins(s: str) -> int:
+        h, m = s.split(":")
+        return int(h) * 60 + int(m)
+
+    _TIME_PAIR = r"(\d{1,2}:\d{2})\s*\|?\s*[-–—]?\s*\|?\s*(\d{1,2}:\d{2})"
+
+    total_min = 0
+    days_found = 0
+    for body in parts[1:]:
+        times = re.findall(_TIME_PAIR, body)
+        if not times:
+            continue
+        try:
+            starts = [_mins(a) for a, _ in times]
+            ends = [_mins(b) for _, b in times]
+        except ValueError:
+            continue
+        span = max(ends) - min(starts)
+        if span <= 0:
+            continue
+        # Перерывы вычитаем там, где график явно помечен «Перерыв».
+        # Ячейки строки могут быть разнесены по разным строкам текста
+        # («13:00» / «-» / «13:30 | Перерыв»), поэтому время берём не из той же
+        # строки, а из окна ПЕРЕД словом: две последние метки времени = начало и конец.
+        brk = 0
+        for m in re.finditer(r"[Пп]ерерыв", body):
+            window = body[max(0, m.start() - 120): m.start()]
+            marks = re.findall(r"\d{1,2}:\d{2}", window)
+            if len(marks) < 2:
+                continue
+            try:
+                d = _mins(marks[-1]) - _mins(marks[-2])
+            except ValueError:
+                continue
+            if 0 < d <= 120:
+                brk += d
+        total_min += max(0, span - brk)
+        days_found += 1
+
+    if not days_found or total_min <= 0 or hours_per_day <= 0:
+        return None
+    return round(total_min / 60.0 / hours_per_day, 3)
+
+
+def _norm_proc(s: str) -> str:
+    """Нормализация названия процесса для сверки (регистр, ё, пробелы)."""
+    return re.sub(r"\s+", " ", (s or "").lower().replace("ё", "е")).strip()
+
+
+def extract_akt_smk_processes(akt_text: str) -> list:
+    """Перечень процессов СМК из Акта предыдущего аудита.
+
+    Ищем список после «...процессы, необходимые для функционирования СМК:».
+    Текст Акта обычно OCR-ный, поэтому перечень режем по границе страницы /
+    отметки о версии формы и отбрасываем строки с цифрами (реквизиты, номера
+    карт процессов, колонтитулы) — иначе в список попадает OCR-мусор.
+    """
+    if not akt_text:
+        return []
+    m = re.search(
+        r"процессы,\s*необходимые\s*для\s*функционирования\s*СМК\s*:?(.{0,1500})",
+        akt_text, re.S | re.I,
+    )
+    if not m:
+        return []
+    seg = re.split(r"-{2,}\s*Страница|вер\.\s*\d|Описание\s+процессов", m.group(1))[0]
+    out = []
+    for chunk in re.split(r"[;\n]", seg):
+        name = re.sub(r"\s+", " ", chunk).strip(" .;:·-—")
+        if not (5 < len(name) < 70):
+            continue
+        if not re.match(r"^[А-ЯЁ]", name) or re.search(r"\d", name):
+            continue
+        if name not in out:
+            out.append(name)
+    return out
+
+
 def _files_by_keyword(file_names: list, keywords: list) -> list:
     """Возвращает файлы, в имени которых встречается ЛЮБАЯ из подстрок (без учёта регистра)."""
     if not keywords:
@@ -3162,6 +3266,10 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         found_any = False
                         local_total = 0.0
                         local_parts = []
+                        # С графиком Плана сверяется ТОЛЬКО «На территории Заказчика»:
+                        # график описывает работу на площадке, а «Вне территории»
+                        # (документарная экспертиза) в него не входит по определению.
+                        # Показываем её в reason справочно, но в R_total не включаем.
                         for territ in ("Вне территории", "На территории"):
                             mt = re.search(
                                 territ + r"\s*Заказчика\s*:?\s*\|\s*([\d,\.]+|[-–—])",
@@ -3173,39 +3281,61 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                                     continue
                                 try:
                                     n = float(val)
+                                except ValueError:
+                                    continue
+                                if territ == "На территории":
                                     local_total += n
                                     local_parts.append(f"{territ}: {mt.group(1)}")
                                     found_any = True
-                                except ValueError:
-                                    pass
+                                else:
+                                    local_parts.append(
+                                        f"{territ}: {mt.group(1)} (в сверку не входит)"
+                                    )
                         if found_any:
                             r_total = local_total
                             r_parts = local_parts
                             break
 
+                # Трудоёмкость по Плану: приоритетно считаем по ГРАФИКУ (нетто-часы / 8),
+                # т.к. рабочий день в графике обычно длиннее 8 ч и календарные дни дают
+                # заниженную оценку (4 дня по 9 ч = 4,5 аудитодня, а не 4).
+                p_sched = _plan_onsite_audit_days(plan_raw)
+                p_total = None
+                p_basis = ""
+                if p_experts:
+                    if p_sched is not None:
+                        p_total = p_sched * p_experts
+                        p_basis = (
+                            f"по графику {p_sched:g} аудитодн."
+                            + (f" ({p_days} кал. дн.)" if p_days else "")
+                            + f" × {p_experts} эксп. = {p_total:g}"
+                        )
+                    elif p_days:
+                        p_total = p_days * p_experts
+                        p_basis = f"{p_days} кал. дн. × {p_experts} эксп. = {p_total:g}"
+
                 print(
                     f"[item 3 numbers] audit_type='{audit_type}' rasch_key='{rasch_key}' "
-                    f"P_days={p_days} P_experts={p_experts} R_total={r_total}"
+                    f"P_days={p_days} P_sched={p_sched} P_experts={p_experts} "
+                    f"P_total={p_total} R_total={r_total}"
                 )
 
-                if p_days and p_experts and r_total is not None:
-                    p_total = p_days * p_experts
+                if p_total is not None and r_total is not None:
                     # Сравнение с допуском 0.01 (на случай 9.5 vs 9.50).
                     if abs(p_total - r_total) < 0.01:
                         verdict["ok"] = True
                         verdict["nok"] = False
                         verdict["reason"] = (
-                            f"Трудоёмкость согласована: Расчёт R_total={r_total:g} чел.-дн. "
-                            f"({'; '.join(r_parts)}) = План P_days × P_experts = "
-                            f"{p_days} × {p_experts} = {p_total:g}."
+                            f"Трудоёмкость согласована: Расчёт {r_total:g} аудитодн. "
+                            f"({'; '.join(r_parts)}) = План {p_basis}."
                         )
                     else:
                         verdict["ok"] = False
                         verdict["nok"] = True
                         verdict["reason"] = (
-                            f"Трудоёмкость НЕ совпадает: в Расчёте R_total={r_total:g} чел.-дн. "
-                            f"({'; '.join(r_parts)}); по Плану P_days × P_experts = "
-                            f"{p_days} × {p_experts} = {p_total:g}. Разница {abs(p_total - r_total):g}."
+                            f"Трудоёмкость НЕ совпадает: в Расчёте {r_total:g} аудитодн. "
+                            f"({'; '.join(r_parts)}); по Плану {p_basis}. "
+                            f"Разница {abs(p_total - r_total):g}."
                         )
                 elif not rasch_files:
                     verdict["ok"] = False
@@ -3479,6 +3609,44 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                             f"[авто-OK: исключения в Плане — {', '.join(found_pts)}, все легитимны "
                             f"(7.1.3.5/7.1.4.3 с пометкой «1 абзац»).]"
                         )
+
+            # Пункт 14 (idx=13): процессы СМК из Акта предыдущего аудита должны
+            # присутствовать в Плане. Считаем детерминированно: процессы в Плане
+            # «спрятаны» внутри плотных строк таблицы графика (вперемешку с ФИО,
+            # адресами и пунктами стандарта), и модель их регулярно не вычленяет —
+            # получался ложный NOK на корректном Плане. Формат записи процессов в
+            # Плане отличается от шаблона к шаблону («Процесс П1» / «Процессы СМК:
+            # Управление персоналом, ...»), поэтому ищем вхождение по всему тексту.
+            if idx == 13 and plan_raw:
+                akt_procs, akt_src = [], ""
+                for f in relevant:
+                    procs = extract_akt_smk_processes(all_texts.get(f, ""))
+                    if procs:
+                        akt_procs, akt_src = procs, f
+                        break
+
+                if akt_procs:
+                    plan_norm = _norm_proc(plan_raw)
+                    missing = [p for p in akt_procs if _norm_proc(p) not in plan_norm]
+                    shown = "; ".join(akt_procs[:12]) + ("…" if len(akt_procs) > 12 else "")
+                    if missing:
+                        verdict["ok"] = False
+                        verdict["nok"] = True
+                        verdict["reason"] = (
+                            f"В Плане отсутствуют процессы СМК, указанные в «{akt_src}» "
+                            f"({len(missing)} из {len(akt_procs)}): {'; '.join(missing)}."
+                        )
+                    else:
+                        verdict["ok"] = True
+                        verdict["nok"] = False
+                        verdict["reason"] = (
+                            f"Все процессы СМК из «{akt_src}» ({len(akt_procs)} шт.) "
+                            f"присутствуют в Плане: {shown}."
+                        )
+                    print(
+                        f"[item 14 processes] источник='{akt_src}' всего={len(akt_procs)} "
+                        f"нет в Плане={len(missing)} → {'NOK' if missing else 'OK'}"
+                    )
 
             # Пункт 15 (idx=14): для каждой строки с «Процесс» в Плане должны быть
             # пункты 4.4.1, 4.4.2, 4.4.3.
