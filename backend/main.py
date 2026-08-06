@@ -1666,10 +1666,16 @@ def verify_item_strict(api_key: str, item: dict, ii_references: dict,
                         extra_instructions: str = "",
                         comparison: bool = False,
                         compare_fields: str = "",
-                        expected_file_keywords: Optional[list] = None) -> dict:
+                        expected_file_keywords: Optional[list] = None,
+                        accepted_source_files: Optional[list] = None) -> dict:
     """
     Строгая проверка пункта чек-листа с NOK-first логикой.
     Возвращает: {ok, nok, reason, ii_data_found, evidence_quote, source_file}.
+
+    accepted_source_files — файлы, уже отобранные движком как источники для этого
+    пункта (по имени либо по содержимому). Нужны, чтобы проверка «модель сверила
+    не с тем файлом» не браковала документ с неудачным именем: «ДС2 СМК ВИК.pdf»
+    не содержит ключа «договор», хотя внутри это доп.соглашение к нужному договору.
     """
     ii_markers = item.get("ii_markers", [])
     ii_context = "\n".join([f"- {m}: {ii_references.get(m, '')[:150]}" for m in ii_markers])
@@ -1832,8 +1838,17 @@ ok и nok — взаимоисключающие: ровно один true, др
         extracted = result.get("extracted_values") or []
 
         def _norm(s: str) -> str:
-            # Нормализация для поиска подстроки: убираем пробелы, ё→е, lower.
-            return re.sub(r"\s+", "", (s or "").lower().replace("ё", "е"))
+            """Нормализация для поиска подстроки в evidence.
+
+            Убираем пробелы, ё→е, регистр, а также маркеры списков и все виды
+            тире. В PDF маркер часто приходит глифом шрифта (private use area,
+            напр. U+F02D), а модель переписывает его обычным дефисом — из-за
+            расхождения в первом же символе реальная цитата считалась
+            выдуманной. Чистим обе стороны одинаково.
+            """
+            s = (s or "").lower().replace("ё", "е")
+            s = re.sub("[-‐-―−•▪◦·-]", "", s)
+            return re.sub(r"\s+", "", s)
 
         evidence_norm = _norm(evidence or "")
 
@@ -1867,6 +1882,7 @@ ok и nok — взаимоисключающие: ровно один true, др
             hallucinations = []
             wrong_files = []
             kw_norm = [k.lower() for k in (expected_file_keywords or []) if k]
+            accepted_norm = [f.lower() for f in (accepted_source_files or []) if f]
             # Слова, по которым понимаем что other_file — это «План аудита» (его не считаем нужным источником)
             plan_markers = ("план", "plan")
 
@@ -1975,6 +1991,12 @@ ok и nok — взаимоисключающие: ровно один true, др
                         # other_file должен содержать хотя бы одно ключевое слово ИЛИ быть Планом
                         # (если поле сравнивается «План vs План» — норм). Но обычно нужен внешний.
                         is_expected = any(k in other_name for k in kw_norm)
+                        # Либо это файл, который движок сам отобрал в источники —
+                        # тогда имя роли не играет (отбор мог пройти по содержимому).
+                        if not is_expected and accepted_norm:
+                            is_expected = any(
+                                other_name in f or f in other_name for f in accepted_norm
+                            )
                         is_plan = any(p in other_name for p in plan_markers) and "плана" not in other_name
                         if not is_expected and not is_plan:
                             wrong_files.append(
@@ -3174,7 +3196,8 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                                           extra_instructions=extra_rules,
                                           comparison=comparison_flag,
                                           compare_fields=compare_fields,
-                                          expected_file_keywords=expected_file_keywords)
+                                          expected_file_keywords=expected_file_keywords,
+                                          accepted_source_files=relevant)
 
             if verdict.get("ok"):
                 processing_status["detail"] = "adversarial-перепроверка OK-вердикта..."
