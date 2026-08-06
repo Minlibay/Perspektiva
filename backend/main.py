@@ -1837,6 +1837,26 @@ ok и nok — взаимоисключающие: ровно один true, др
 
         evidence_norm = _norm(evidence or "")
 
+        def _quote_grounded(quote_norm: str, window: int = 60) -> bool:
+            """Подтверждена ли цитата текстом файлов.
+
+            Короткие значения (номер, дата, ФИО) проверяем строго — целиком.
+            Для длинных формулировок требовать дословного совпадения нельзя:
+            модель склеивает текст через границы строк и таблиц, а в сканах
+            OCR искажает хвост («шеф-монта монта:» вместо «шеф-монтажу,
+            монтажу»). Из-за этого браковались реальные данные. Поэтому для
+            длинной цитаты достаточно дословного начала: подделать осмысленный
+            фрагмент такой длины модель не может, а расхождения в хвосте —
+            это шум распознавания, а не выдумка.
+            """
+            if not quote_norm:
+                return True
+            if quote_norm in evidence_norm:
+                return True
+            if len(quote_norm) > window:
+                return quote_norm[:window] in evidence_norm
+            return False
+
         if ok and (not isinstance(extracted, list) or len(extracted) == 0):
             ok, nok = False, True
             result["reason"] = ("[авто-NOK: режим сверки требует извлечь и сравнить значения, "
@@ -1932,7 +1952,7 @@ ok и nok — взаимоисключающие: ровно один true, др
                         continue
                     if any(m in raw_lc for m in _ABSENCE_MARKERS):
                         continue
-                    if _norm(raw) and _norm(raw) not in evidence_norm:
+                    if _norm(raw) and not _quote_grounded(_norm(raw)):
                         hallucinations.append(
                             f"{row.get('field', 'поле')} [{key}]: '{raw[:80]}' нет в тексте файлов"
                         )
@@ -3005,6 +3025,34 @@ def _files_by_keyword(file_names: list, keywords: list) -> list:
     return matched
 
 
+def _files_by_content_keyword(file_names: list, all_texts: dict, keywords: list,
+                              head_chars: int = 600) -> list:
+    """Запасной отбор: ищем тип документа в НАЧАЛЕ его текста, а не в имени файла.
+
+    Файлы часто называют аббревиатурами («ДС2 СМК ВИК.pdf» вместо «Доп.соглашение
+    №2 к договору»), из-за чего отбор по имени промахивается и пункт получает
+    авто-NOK, хотя нужный документ загружен и внутри прямо назван
+    («Дополнительное соглашение №2 к Договору № ...»).
+
+    Смотрим только ЗАГОЛОВОК (первые head_chars символов): документ называет свой
+    тип в первых строках, тогда как упоминания в глубине текста — это ссылки на
+    другие документы, и брать их нельзя. На реальном пакете разделение чистое:
+    доп.соглашение называет себя на позиции 40, а План и Акт упоминают договор
+    только на 2108 и 1492 — окно в 600 символов отсекает их.
+    """
+    if not keywords:
+        return []
+    kws = [k.lower() for k in keywords]
+    matched = []
+    for f in file_names:
+        head = (all_texts.get(f) or "")[:head_chars].lower().replace("ё", "е")
+        if not head:
+            continue
+        if any(kw in head for kw in kws):
+            matched.append(f)
+    return matched
+
+
 def process_checklist_advanced(api_key: str, all_texts: dict,
                                 checklist_structure: list,
                                 ii_references: dict,
@@ -3064,8 +3112,22 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                 if relevant:
                     keyword_hit = True
                 else:
-                    # Фоллбэк: общий поиск по разделу/ключевым словам
-                    relevant = find_relevant_files_for_item(item, all_texts)
+                    # Имя не подошло — ищем тип документа внутри текста (см.
+                    # _files_by_content_keyword): иначе файл с «неудачным» именем
+                    # даёт авто-NOK, хотя нужные реквизиты в нём есть.
+                    by_content = _files_by_content_keyword(
+                        file_names, all_texts, rule["file_keywords"]
+                    )
+                    if by_content:
+                        relevant = by_content
+                        keyword_hit = True
+                        print(
+                            f"[item {idx+1}/{total}] источник найден по содержимому "
+                            f"(имя не подошло): {', '.join(by_content)}"
+                        )
+                    else:
+                        # Фоллбэк: общий поиск по разделу/ключевым словам
+                        relevant = find_relevant_files_for_item(item, all_texts)
             else:
                 relevant = find_relevant_files_for_item(item, all_texts)
 
