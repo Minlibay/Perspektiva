@@ -54,6 +54,16 @@ from fastapi.staticfiles import StaticFiles
 app.mount("/", StaticFiles(directory="../frontend/dist", html=True), name="static")
 ```
 
+### 4. Тесты backend
+
+```bash
+cd backend
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+Чек-листы, их правила и план подключения — [docs/ЧЕК-ЛИСТЫ.md](docs/ЧЕК-ЛИСТЫ.md).
+
 ## Использование
 
 1. **Введите API ключ GigaChat** в настройках и сохраните
