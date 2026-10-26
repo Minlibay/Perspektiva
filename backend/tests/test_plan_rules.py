@@ -159,6 +159,13 @@ def test_plan_exclusions_mismatch_and_fallback(checklist_path, stub_gigachat, mo
     assert by_rid[19]["reason"].startswith("Источник для сверки исключений")
 
 
+def test_post_audit_documents_are_not_plan_sources(checklist_path, stub_gigachat, monkeypatch):
+    # «План КД» подходит под ключевое слово «план», но это документ после аудита
+    pkd = "ПЛАН корректирующих действий по несоответствиям\nУТВЕРЖДАЮ «03» августа 2026 г."
+    by_rid = _run_plan(checklist_path, {"План КД.docx": pkd}, monkeypatch=monkeypatch)
+    assert all("План КД.docx" not in v.get("_files_checked", []) for v in by_rid.values())
+
+
 def test_plan_dki_sample(samples_dir, checklist_path, stub_gigachat):
     """Пакет ДКИ (2-й ИК): План утверждён 17.07, Приказ 13.07, начало 27.07 —
     прежнее правило «окна ≤5 рабочих дней» давало здесь NOK."""

@@ -9,6 +9,7 @@ import shutil
 import json
 import uuid
 import re
+import threading
 from datetime import datetime
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -27,7 +28,16 @@ import openpyxl
 
 import checklists
 import doc_types
+import formula_checks
+import package
 from checklists import open_docx as _open_docx_or_docm
+from fields import (
+    add_workdays as _add_workdays,
+    exclusion_block as _exclusion_block,
+    exclusion_clauses as _exclusion_clauses,
+    normalize_org_name as _normalize_applicant_name,
+    ru_month as _ru_month,
+)
 
 app = FastAPI(title="Audit Plan Filler", version="1.0.0")
 
@@ -145,33 +155,75 @@ def _get_active_scope() -> str:
     """Активный OAuth scope: из настроек, иначе DEFAULT_GIGACHAT_SCOPE."""
     return (_load_settings().get("scope") or "").strip() or DEFAULT_GIGACHAT_SCOPE
 
-# Глобальный статус обработки — для опроса прогресса из UI
-processing_status = {
-    "stage": "idle",        # idle | header | verify | done | error
-    "current": 0,           # текущий пункт чек-листа
-    "total": 0,             # всего пунктов
-    "message": "",          # текст для отображения
-    "detail": "",           # подробность (файлы, этап)
-}
+# Статус обработки — у каждой сессии свой (раньше был один словарь на весь сервер, и при
+# двух пользователях каждый видел прогресс чужой проверки).
+def _new_status() -> dict:
+    return {
+        "stage": "idle",        # idle | extract | preflight | header | verify | fill | validate | done | error
+        "current": 0,           # текущий пункт / файл
+        "total": 0,             # всего пунктов / файлов
+        "message": "",          # текст для отображения
+        "detail": "",           # подробность (файлы, этап)
+        "running": False,       # идёт фоновая проверка
+        "checklist": None,      # чек-лист, который проверяется сейчас
+        "outputs": [],          # готовые результаты — появляются по мере проверки
+        "error": None,
+        "started_at": None,
+        "finished_at": None,
+    }
 
+
+_JOBS: dict = {}            # session_id → статус проверки
+_ANALYSIS: dict = {}        # session_id → прогресс чтения файлов при разборе пакета
+_SESSION_LOCKS: dict = {}   # session_id → блокировка кэша текстов
+_JOBS_LOCK = threading.Lock()
+_status_local = threading.local()
+_FALLBACK_STATUS = _new_status()
+
+
+def _job_status(session_id: str) -> dict:
+    with _JOBS_LOCK:
+        return _JOBS.setdefault(session_id, _new_status())
+
+
+def _analysis_status(session_id: str) -> dict:
+    with _JOBS_LOCK:
+        return _ANALYSIS.setdefault(session_id, {"stage": "idle", "current": 0, "total": 0,
+                                                 "message": "", "detail": ""})
+
+
+def _session_lock(session_id: str) -> threading.Lock:
+    with _JOBS_LOCK:
+        return _SESSION_LOCKS.setdefault(session_id, threading.Lock())
+
+
+class _StatusProxy:
+    """processing_status для пайплайнов Плана и Сводного акта: пишет в статус проверки,
+    которую выполняет текущий поток (_status_local.status)."""
+
+    def _target(self) -> dict:
+        return getattr(_status_local, "status", None) or _FALLBACK_STATUS
+
+    def update(self, *args, **kwargs):
+        self._target().update(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        self._target()[key] = value
+
+    def __getitem__(self, key):
+        return self._target()[key]
+
+    def get(self, key, default=None):
+        return self._target().get(key, default)
+
+
+processing_status = _StatusProxy()
 
 class GigaChatSettings(BaseModel):
     """Настройки подключения к GigaChat"""
     api_key: str
     model: Optional[str] = None
     scope: Optional[str] = None
-
-
-class ProcessingResult(BaseModel):
-    """Результат обработки"""
-    status: str
-    message: str
-    extracted_data: Optional[dict] = None
-    output_file: Optional[str] = None
-    validation: Optional[dict] = None
-    analyzed_files: Optional[list[str]] = None
-    outputs: Optional[list[dict]] = None  # по одному элементу на каждый обработанный чек-лист
-    document_types: Optional[dict] = None  # {файл: тип документа} — doc_types.classify_document
 
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -589,6 +641,18 @@ def fill_svod_with_checklist(template_path: str, extracted_data: dict, output_pa
     в «Проблемные зоны». Шапки Заявителя в этом чек-листе нет. Пункт без вердикта
     («проверить вручную») остаётся с пустыми ОК/NOK.
     """
+    doc = _open_docx_or_docm(template_path)
+    items = checklist_structure or checklists.parse_checklist(doc)
+    checklists.write_marks(doc, items, extracted_data.get("checklist", []),
+                           ok_mark="V", nok_mark="V", write_reason=True, mark_size=10)
+    doc.save(output_path)
+    return output_path
+
+
+def fill_formula_checklist(template_path: str, extracted_data: dict, output_path: str,
+                           checklist_structure: list[dict] = None) -> str:
+    """Заполнение чек-листов «по формулам» (ПКД, Отчет КД, ПН, Листы оценки): «V» в ОК
+    или NOK и обоснование в последней колонке (в шаблоне там подсказка-источник)."""
     doc = _open_docx_or_docm(template_path)
     items = checklist_structure or checklists.parse_checklist(doc)
     checklists.write_marks(doc, items, extracted_data.get("checklist", []),
@@ -1087,53 +1151,6 @@ def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") 
             result[key] = "не найдено"
 
     return result
-
-
-_OPF_EXPANSIONS = [
-    ("публичное акционерное общество", "пао"),
-    ("непубличное акционерное общество", "нао"),
-    ("акционерное общество", "ао"),
-    ("общество с ограниченной ответственностью", "ооо"),
-    ("закрытое акционерное общество", "зао"),
-    ("открытое акционерное общество", "оао"),
-    ("индивидуальный предприниматель", "ип"),
-]
-
-
-def _normalize_applicant_name(name: str) -> tuple[str, str]:
-    """Нормализует наименование юр.лица.
-
-    Возвращает (opf, core) — токен ОПФ (ооо/ао/пао/...) и «ядро» (название без ОПФ, без кавычек/пробелов).
-    Любое отклонение в ОПФ (ПААО vs ПАО) или в ядре (Ромашкаа vs Ромашка) даст разные значения.
-    """
-    if not name:
-        return ("", "")
-    s = name.lower().strip()
-    # убираем все виды кавычек и лишние знаки
-    for ch in ['«', '»', '"', '"', '"', "'", '`', '(', ')', '\n', '\t']:
-        s = s.replace(ch, ' ')
-    # схлопываем пробелы
-    s = re.sub(r'\s+', ' ', s).strip()
-
-    # развёрнутая ОПФ → аббревиатура (сравниваем полные формы до коротких, чтобы «акционерное общество» не съело «публичное акционерное общество»)
-    opf = ""
-    for full, short in _OPF_EXPANSIONS:
-        if s.startswith(full + ' ') or s == full:
-            opf = short
-            s = s[len(full):].strip()
-            break
-    if not opf:
-        # Если ОПФ-аббревиатура — первое короткое «слово» (2–6 букв) перед названием.
-        # Сюда попадает и валидное «ПАО», и опечатки вида «ПААО» — то, что и нужно ловить.
-        parts = s.split(' ', 1)
-        head = parts[0]
-        if 2 <= len(head) <= 6 and head.isalpha():
-            opf = head
-            s = parts[1] if len(parts) > 1 else ''
-
-    # ядро — буквы и цифры (выкидываем пунктуацию и пробелы для устойчивого сравнения)
-    core = re.sub(r'[^0-9a-zа-яё]+', '', s)
-    return (opf, core)
 
 
 def cross_check_applicant_name(api_key: str, plan_text: str, sources_texts: dict,
@@ -2998,20 +3015,6 @@ def extract_akt_smk_processes(akt_text: str) -> list:
     return out
 
 
-_MONTHS_RU = {
-    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
-    "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
-}
-
-
-def _ru_month(word: str) -> Optional[int]:
-    w = (word or "").lower().replace("ё", "е")
-    for stem, n in _MONTHS_RU.items():
-        if w.startswith(stem):
-            return n
-    return None
-
-
 def _plan_approval_date(plan_raw: str):
     """Дата утверждения Плана из блока «УТВЕРЖДАЮ»: «17» июля 2026 г. / « 01 » декабря 20 25 г."""
     from datetime import date
@@ -3061,42 +3064,6 @@ def _prikaz_date(text: str):
         except ValueError:
             pass
     return None
-
-
-def _add_workdays(d, n: int):
-    """d ± n рабочих дней (Пн–Пт): _add_workdays(10.02.2026, -5) = 03.02.2026."""
-    from datetime import timedelta
-    step = 1 if n >= 0 else -1
-    left, cur = abs(n), d
-    while left:
-        cur += timedelta(days=step)
-        if cur.weekday() < 5:
-            left -= 1
-    return cur
-
-
-def _exclusion_block(text: str) -> Optional[str]:
-    """Раздел «Исключения из требований стандарта(ов)» — до следующего нумерованного
-    раздела («9 …», «10 …») или 700 символов. Раньше брали 2000 символов — это захватывало
-    соседний раздел графика с пунктами процессов (4.4.1, 4.3.2) и давало ложный NOK."""
-    m = re.search(r"исключения из требований", text or "", re.IGNORECASE)
-    if not m:
-        return None
-    raw_block = text[m.start(): m.start() + 2000]
-    next_section = re.search(r'\n\s*(?:9|10|11|12)\s+[А-ЯA-Z]', raw_block)
-    return raw_block[: next_section.start()] if next_section else raw_block[:700]
-
-
-def _exclusion_clauses(block: str) -> list:
-    """Пункты СТО в разделе исключений — только те, рядом с которыми есть контекст
-    исключения ('п.', 'пункт', 'абзац', 'не применяется', 'исключ'). Без дублей."""
-    found = []
-    for p in re.findall(r'\b(\d{1,2}(?:\.\d{1,2}){2,4})\b', block or ""):
-        pos = block.find(p)
-        ctx = block[max(0, pos - 40): pos + 80].lower()
-        if any(k in ctx for k in ("п.", "пункт", "абзац", "не применя", "исключ")):
-            found.append(p)
-    return list(dict.fromkeys(found))
 
 
 _DAY_HEADER_RE = re.compile(r"(\d{1,2})\s*-?\s*й\s+день\.?\s*(\d{1,2}\.\d{1,2}\.\d{2,4})?", re.IGNORECASE)
@@ -3182,6 +3149,9 @@ def _files_by_content_keyword(file_names: list, all_texts: dict, keywords: list,
     return matched
 
 
+_AFTER_AUDIT_DOC_TYPES = {"pkd", "otchet_kd", "pn", "loo_org", "loo_exp", "zakl", "zakl1", "otchet_ustr1"}
+
+
 def process_checklist_advanced(api_key: str, all_texts: dict,
                                 checklist_structure: list,
                                 ii_references: dict,
@@ -3237,6 +3207,13 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
             "РЭГ": "не найдено",
         }
 
+    # Документы, которые появляются ПОСЛЕ аудита (ПКД, Отчет КД, Протоколы НС, Листы
+    # оценки, Заключения, Отчет об устранении НС 1 этапа), источниками для Плана не
+    # бывают. Когда грузят весь пакет,
+    # «План КД» иначе попадал в evidence по слову «план» в имени.
+    plan_sources = {f: t for f, t in all_texts.items()
+                    if doc_type_map.get(f) not in _AFTER_AUDIT_DOC_TYPES}
+
     checklist_results = []
 
     for idx, item in enumerate(checklist_structure):
@@ -3250,7 +3227,7 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
         try:
             rid = _plan_rule_id(item)
             rule = ITEM_RULES.get(rid)
-            file_names = list(all_texts.keys())
+            file_names = list(plan_sources.keys())
 
             keyword_hit = False
             if rule and rule.get("file_keywords"):
@@ -3263,7 +3240,7 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                     # _files_by_content_keyword): иначе файл с «неудачным» именем
                     # даёт авто-NOK, хотя нужные реквизиты в нём есть.
                     by_content = _files_by_content_keyword(
-                        file_names, all_texts, rule["file_keywords"]
+                        file_names, plan_sources, rule["file_keywords"]
                     )
                     if by_content:
                         relevant = by_content
@@ -3274,9 +3251,9 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         )
                     else:
                         # Фоллбэк: общий поиск по разделу/ключевым словам
-                        relevant = find_relevant_files_for_item(item, all_texts)
+                        relevant = find_relevant_files_for_item(item, plan_sources)
             else:
-                relevant = find_relevant_files_for_item(item, all_texts)
+                relevant = find_relevant_files_for_item(item, plan_sources)
 
             print(f"[item {idx+1}/{total}] релевантных файлов: {len(relevant)} (keyword_hit={keyword_hit})")
 
@@ -4681,6 +4658,64 @@ async def root():
     return {"message": "Audit Plan Filler API", "version": "1.0.0"}
 
 
+def _validate_plan_output(file_path: Path) -> dict:
+    """Проверка заполненного Плана АУДИТА: шапка заполнена, в каждой строке ровно одна
+    отметка ОК/NOK."""
+    doc = Document(str(file_path))
+    header_filled = []
+
+    for table in doc.tables:
+        cols = len(table.rows[0].cells)
+
+        if cols == 2:  # Шапка
+            for row in table.rows:
+                text = " ".join(cell.text.strip() for cell in row.cells)
+                right = row.cells[1].text.strip() if len(row.cells) > 1 else ""
+                if any(k in text for k in ["Заявител", "Вид аудита", "Даты", "РЭГ"]):
+                    header_filled.append(bool(right and len(right) > 2))
+
+    # Отметки ОК/NOK — по колонкам, найденным по заголовкам таблицы чек-листа
+    checklist_rows = []
+    for row in checklists.read_marks(doc, ok_marks=("☑",), nok_marks=("☒",)):
+        checklist_rows.append({
+            "area": row["area"][:60],
+            "ok": row["ok"],
+            "nok": row["nok"],
+            "both": row["ok"] and row["nok"],
+            "none": not row["ok"] and not row["nok"],
+        })
+
+    issues = []
+    for i, row in enumerate(checklist_rows):
+        if row["both"]:
+            issues.append(f"Строка {i+1}: ОБА маркера OK и NOK")
+        elif row["none"]:
+            issues.append(f"Строка {i+1}: НЕТ маркера")
+
+    # Структурные проблемы заполнения
+    if len(checklist_rows) == 0:
+        issues.append("Чек-лист не распознан: ни одной строки не найдено (проверь шаблон)")
+    if header_filled and not all(header_filled):
+        missing = len(header_filled) - sum(header_filled)
+        issues.append(f"Шапка заполнена не полностью: {missing} из {len(header_filled)} полей пусты")
+
+    ok_count = sum(1 for r in checklist_rows if r["ok"])
+    nok_count = sum(1 for r in checklist_rows if r["nok"])
+
+    # NOK в чек-листе — это содержательная проблема, тоже отражаем как issue.
+    if nok_count > 0:
+        issues.append(f"Обнаружены замечания (NOK): {nok_count} из {len(checklist_rows)} пунктов")
+
+    return {
+        "valid": len(issues) == 0,
+        "header_filled": f"{sum(header_filled)}/{len(header_filled)} полей",
+        "checklist_total": len(checklist_rows),
+        "ok_count": ok_count,
+        "nok_count": nok_count,
+        "issues": issues
+    }
+
+
 @app.get("/api/validate/{filename:path}")
 async def validate_result(filename: str):
     """Проверка корректности заполненного документа.
@@ -4692,64 +4727,8 @@ async def validate_result(filename: str):
         raise HTTPException(status_code=400, detail="Некорректный путь")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Файл не найден")
-    
-    # Загружаем последнюю структуру чек-листа из сохранённых данных
-    # Для этого прочитаем сохранённый результат если есть
-    # Или просто вердим базовую валидацию
     try:
-        doc = Document(str(file_path))
-        header_filled = []
-
-        for table in doc.tables:
-            cols = len(table.rows[0].cells)
-
-            if cols == 2:  # Шапка
-                for row in table.rows:
-                    text = " ".join(cell.text.strip() for cell in row.cells)
-                    right = row.cells[1].text.strip() if len(row.cells) > 1 else ""
-                    if any(k in text for k in ["Заявител", "Вид аудита", "Даты", "РЭГ"]):
-                        header_filled.append(bool(right and len(right) > 2))
-
-        # Отметки ОК/NOK — по колонкам, найденным по заголовкам таблицы чек-листа
-        checklist_rows = []
-        for row in checklists.read_marks(doc, ok_marks=("☑",), nok_marks=("☒",)):
-            checklist_rows.append({
-                "area": row["area"][:60],
-                "ok": row["ok"],
-                "nok": row["nok"],
-                "both": row["ok"] and row["nok"],
-                "none": not row["ok"] and not row["nok"],
-            })
-
-        issues = []
-        for i, row in enumerate(checklist_rows):
-            if row["both"]:
-                issues.append(f"Строка {i+1}: ОБА маркера OK и NOK")
-            elif row["none"]:
-                issues.append(f"Строка {i+1}: НЕТ маркера")
-
-        # Структурные проблемы заполнения
-        if len(checklist_rows) == 0:
-            issues.append("Чек-лист не распознан: ни одной строки не найдено (проверь шаблон)")
-        if header_filled and not all(header_filled):
-            missing = len(header_filled) - sum(header_filled)
-            issues.append(f"Шапка заполнена не полностью: {missing} из {len(header_filled)} полей пусты")
-
-        ok_count = sum(1 for r in checklist_rows if r["ok"])
-        nok_count = sum(1 for r in checklist_rows if r["nok"])
-
-        # NOK в чек-листе — это содержательная проблема, тоже отражаем как issue.
-        if nok_count > 0:
-            issues.append(f"Обнаружены замечания (NOK): {nok_count} из {len(checklist_rows)} пунктов")
-
-        return {
-            "valid": len(issues) == 0,
-            "header_filled": f"{sum(header_filled)}/{len(header_filled)} полей",
-            "checklist_total": len(checklist_rows),
-            "ok_count": ok_count,
-            "nok_count": nok_count,
-            "issues": issues
-        }
+        return _validate_plan_output(file_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка валидации: {str(e)}")
 
@@ -4822,489 +4801,359 @@ async def upload_files(
             block_files.append(file.filename)
 
     if block:
-        blocks = dict(meta.get("blocks") or {})
+        blocks = {k: [n for n in v if n not in block_files] for k, v in (meta.get("blocks") or {}).items()}
         blocks[block] = block_files
         _save_session_meta(sid, blocks=blocks)
 
     return {"status": "ok", "session_id": sid, "uploaded_files": uploaded, "count": len(uploaded)}
 
 
-@app.post("/api/process")
-async def process_documents(
-    api_key: str = Form(...),
-    template_file: str = Form(...),
-    session_id: str = Form(...),
-    plan_doc_file: Optional[str] = Form(None),
-    plan_doc_file_2: Optional[str] = Form(None),
-    template_file_2: Optional[str] = Form(None),
-):
-    """
-    Обработка документов через GigaChat и заполнение чек-листа(ов).
-    В поле 1 может быть один или два чек-листа: «План АУДИТА» и/или «Сводный акт».
-    Тип каждого определяется автоматически; обрабатываются по очереди (План → Сводный),
-    на выходе — отдельный заполненный файл на каждый чек-лист.
-    """
+# ============================================================================
+# Пакет аудита (этап 4): разбор трёх полей, фоновая проверка, статус по сессии.
+# Поле 1 — бланки чек-листов, поле 2 — проверяемые документы, поле 3 — источники
+# (meta.blocks: checklist / plan / sources). docs/ЧЕК-ЛИСТЫ.md §7.
+# ============================================================================
+
+def _extract_text(path: Path) -> Optional[str]:
+    """Текст файла (docx/docm/pdf/xlsx) или None — формат не поддерживается или ошибка чтения."""
+    suffix = path.suffix.lower()
+    try:
+        if suffix in ('.docx', '.docm'):
+            return extract_text_from_docx(str(path))
+        if suffix == '.pdf':
+            return extract_text_from_pdf(str(path))
+        if suffix == '.xlsx':
+            return extract_text_from_xlsx(str(path))
+    except Exception as e:
+        print(f"ERR Ошибка чтения {path.name}: {e}")
+    return None
+
+
+_EXTRACT_WORKERS = 3
+
+
+def _session_texts(session_id: str, sdir: Path, names: list, status: dict) -> dict:
+    """Тексты файлов сессии с кэшем на диске (_texts.json): повторный разбор пакета и запуск
+    проверки не читают файлы заново — OCR сканов идёт минутами. Кэш сбрасывается для файла,
+    у которого поменялись размер или время изменения."""
+    with _session_lock(session_id):
+        cache_path = sdir / "_texts.json"
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+        texts, todo = {}, []
+        for name in names:
+            try:
+                st = (sdir / name).stat()
+            except OSError:
+                continue
+            stamp = f"{st.st_size}:{int(st.st_mtime)}"
+            hit = cache.get(name)
+            if hit and hit.get("stamp") == stamp:
+                texts[name] = hit.get("text")
+            else:
+                todo.append((name, stamp))
+
+        if todo:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            status.update({"stage": "extract", "current": 0, "total": len(todo),
+                           "message": f"Чтение файлов: 0 из {len(todo)}", "detail": ""})
+            done = 0
+            with ThreadPoolExecutor(max_workers=_EXTRACT_WORKERS) as ex:
+                futures = {ex.submit(_extract_text, sdir / name): (name, stamp) for name, stamp in todo}
+                for fut in as_completed(futures):
+                    name, stamp = futures[fut]
+                    text = fut.result()
+                    texts[name] = text
+                    cache[name] = {"stamp": stamp, "text": text}
+                    done += 1
+                    status.update({"current": done, "message": f"Чтение файлов: {done} из {len(todo)}",
+                                   "detail": name})
+        for stale in set(cache) - set(names):
+            cache.pop(stale, None)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        return texts
+
+
+def _session_package_files(session_id: str, sdir: Path) -> list:
+    """Файлы сессии с полем загрузки (meta.blocks). Файл без поля считается источником."""
+    blocks = _load_session_meta(session_id).get("blocks") or {}
+    field_of = {name: field for field in package.FIELDS for name in blocks.get(field, [])}
+    return [{"name": f["name"], "field": field_of.get(f["name"], "sources"), "path": sdir / f["name"]}
+            for f in _list_session_files(sdir)]
+
+
+def _analyze_session(session_id: str, sdir: Path, overrides: dict, choices: dict, status: dict):
+    """(разбор пакета, файлы с текстами)."""
+    files = _session_package_files(session_id, sdir)
+    texts = _session_texts(session_id, sdir, [f["name"] for f in files], status)
+    for f in files:
+        f["text"] = texts.get(f["name"])
+    return package.analyze_package(files, overrides, choices), files
+
+
+def _normalize_counts(extracted: dict, structure: list):
+    """Приводим число результатов к числу пунктов чек-листа (обрезка/дополнение)."""
+    if "checklist" not in extracted:
+        return
+    actual = extracted["checklist"]
+    n = len(structure)
+    if len(actual) > n:
+        print(f"GigaChat вернул {len(actual)} пунктов, в документе {n}. Обрезано.")
+        extracted["checklist"] = actual[:n]
+    elif len(actual) < n:
+        for i in range(len(actual), n):
+            area_name = structure[i]['area'][:60] if i < len(structure) else f"пункт {i+1}"
+            extracted["checklist"].append({
+                "ok": False, "nok": True,
+                "reason": f"Нет данных для проверки: {area_name}",
+                "problems": f"Нет данных для проверки: {area_name}",
+                "ii_data_found": "",
+            })
+    for item in extracted["checklist"]:
+        item.setdefault("reason", item.get("problems", ""))
+        item.setdefault("ii_data_found", "")
+
+
+def _counts_validation(results: list, notes: Optional[list] = None) -> dict:
+    return {
+        "valid": True,
+        "issues": [],
+        "notes": notes or [],
+        "ok_count": sum(1 for it in results if it.get("ok")),
+        "nok_count": sum(1 for it in results if it.get("nok")),
+        "manual_count": sum(1 for it in results if not it.get("ok") and not it.get("nok")),
+        "total": len(results),
+    }
+
+
+def _output_name(ck: dict, used: set) -> str:
+    """Имя файла результата; План и Сводный — прежние имена (на них ссылается админка)."""
+    base = {"plan": "Заполненный_План_АУДИТА", "svod": "Заполненный_Сводный_акт"}.get(
+        ck["type"], f"Заполненный_ЧК_{ck['title'].replace(' ', '_')}")
+    name, n = f"{base}.docx", 2
+    while name in used:
+        name, n = f"{base}_{n}.docx", n + 1
+    used.add(name)
+    return name
+
+
+def _run_one_checklist(ck: dict, sdir: Path, out_path: Path, api_key: str, model: str,
+                       texts: dict, all_texts: dict, doc_type_map: dict) -> tuple:
+    """Проверка одного чек-листа и заполнение бланка. Возвращает (данные, проверка результата)."""
+    cpath = sdir / ck["file"]
+    ctype = ck["type"]
+    structure = checklists.parse_checklist(str(cpath))
+    checked_text = texts.get(ck["selected"][0]) or ""
+
+    if ctype == "plan":
+        if len(checked_text.strip()) < 100:
+            raise ValueError(f"Не удалось извлечь текст Плана аудита «{ck['selected'][0]}» "
+                             f"(прочитано символов: {len(checked_text.strip())}).")
+        data = process_checklist_advanced(api_key, all_texts, structure, extract_ii_references(str(cpath)),
+                                          model, checked_text, doc_type_map)
+        if "error" in data:
+            raise ValueError(data["error"])
+        _normalize_counts(data, structure)
+        processing_status.update({"stage": "fill", "message": "Заполнение Плана АУДИТА…", "detail": ""})
+        fill_plan_with_checklist(str(cpath), data, str(out_path), structure)
+        processing_status.update({"stage": "validate", "message": "Проверка заполненного Плана…"})
+        validation = _validate_plan_output(out_path)
+        try:
+            applicant_check = cross_check_applicant_name(api_key, checked_text, all_texts, model)
+        except Exception as e:
+            print(f"WARN: cross-check заявителя не выполнен: {e}")
+            applicant_check = None
+        if applicant_check and applicant_check.get("match") is False:
+            note = (f"Наименование заявителя в Плане и в источниках различается. "
+                    f"План: «{applicant_check.get('plan_name') or '—'}». "
+                    f"Источники: «{applicant_check.get('sources_name') or '—'}».")
+            if applicant_check.get("note"):
+                note += f" {applicant_check['note']}"
+            validation["notes"] = list(validation.get("notes") or []) + [note]
+            validation["applicant_check"] = applicant_check
+        return data, validation
+
+    if ctype == "svod":
+        if len(checked_text.strip()) < 100:
+            raise ValueError(f"Не удалось извлечь текст Сводного акта «{ck['selected'][0]}».")
+        data = process_checklist_svod(api_key, all_texts, structure, model, checked_text)
+        _normalize_counts(data, structure)
+        processing_status.update({"stage": "fill", "message": "Заполнение Сводного акта…", "detail": ""})
+        fill_svod_with_checklist(str(cpath), data, str(out_path), structure)
+        return data, _counts_validation(data.get("checklist", []))
+
+    processing_status.update({"stage": "verify", "current": 0, "total": len(structure),
+                              "message": f"Проверка: {ck['title']}", "detail": ""})
+    data = formula_checks.run_checklist(ctype, structure, {n: texts.get(n) or "" for n in ck["selected"]},
+                                        all_texts, doc_type_map)
+    processing_status.update({"stage": "fill", "message": f"Заполнение: {ck['title']}", "detail": ""})
+    fill_formula_checklist(str(cpath), data, str(out_path), structure)
+    notes = [v for k, v in formula_checks.ASSUMPTIONS.items() if ctype.startswith(k)]
+    return data, _counts_validation(data.get("checklist", []), notes)
+
+
+def _run_package_job(session_id: str, sdir: Path, api_key: str, selection: list,
+                     overrides: dict, choices: dict):
+    """Фоновая проверка выбранных чек-листов. Результат каждого чек-листа появляется в
+    статусе сразу после него; ошибка одного чек-листа не останавливает остальные."""
+    status = _job_status(session_id)
+    _status_local.status = status
+    model, scope = _get_active_model(), _get_active_scope()
+    try:
+        analysis, files = _analyze_session(session_id, sdir, overrides, choices, status)
+        by_file = {c["file"]: c for c in analysis["checklists"]}
+        todo = [by_file[n] for n in selection if n in by_file and by_file[n]["ready"]]
+        todo.sort(key=lambda c: {"plan": 0, "svod": 1}.get(c["type"], 2))
+        texts = {f["name"]: f["text"] for f in files}
+        docs = [f for f in analysis["files"] if f["kind"] == "document"]
+        all_texts = {d["name"]: texts[d["name"]] for d in docs if texts.get(d["name"]) is not None}
+        doc_type_map = {d["name"]: d["doc_type"] for d in docs}
+
+        gigachat_error = None
+        if any(c["needs_gigachat"] for c in todo):
+            status.update({"stage": "preflight", "message": f"Проверка соединения с GigaChat ({model})…",
+                           "detail": ""})
+            pf = gigachat_preflight(api_key, 8.0, model, scope)
+            if not pf["ok"]:
+                gigachat_error = f"GigaChat недоступен ({pf['stage']}): {pf['detail']}"
+
+        out_dir = OUTPUT_DIR / session_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        used_names = set()
+        for i, ck in enumerate(todo, 1):
+            status.update({"checklist": ck["title"], "stage": "verify", "current": 0,
+                           "total": ck["items"] or 0, "message": f"{ck['title']} ({i} из {len(todo)})",
+                           "detail": ""})
+            out = {"type": ck["type"], "title": ck["title"], "checklist_file": ck["file"],
+                   "checked_files": ck["selected"], "warnings": ck["warnings"]}
+            try:
+                if ck["needs_gigachat"] and gigachat_error:
+                    raise RuntimeError(gigachat_error)
+                out_name = _output_name(ck, used_names)
+                data, validation = _run_one_checklist(ck, sdir, out_dir / out_name, api_key, model,
+                                                      texts, all_texts, doc_type_map)
+                results = data.get("checklist", [])
+                out.update({
+                    "output_file": f"{session_id}/{out_name}",
+                    "ok_count": sum(1 for it in results if it.get("ok")),
+                    "nok_count": sum(1 for it in results if it.get("nok")),
+                    "manual_count": sum(1 for it in results if not it.get("ok") and not it.get("nok")),
+                    "total_items": len(results),
+                    "header": data.get("header") or None,
+                    "checklist": results,
+                    "validation": validation,
+                })
+            except Exception as e:
+                print(f"[{ck['title']}] ошибка: {e}")
+                out["error"] = str(e)[:500]
+            status["outputs"] = status["outputs"] + [out]
+
+        done = [o for o in status["outputs"] if not o.get("error")]
+        applicant = next((d["org"] for d in docs if d["org"] and any(d["name"] in c["selected"] for c in todo)), None)
+        _save_session_meta(
+            session_id,
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            model=model if any(c["needs_gigachat"] for c in todo) else None,
+            outputs=status["outputs"],
+            document_types=doc_type_map,
+            applicant=applicant,
+            output_file=done[0]["output_file"] if done else None,
+            ok_count=sum(o["ok_count"] for o in done),
+            nok_count=sum(o["nok_count"] for o in done),
+            total_items=sum(o["total_items"] for o in done),
+            header=next((o["header"] for o in done if o.get("header")), None),
+            checklist=done[0]["checklist"] if done else None,
+        )
+        failed = len(status["outputs"]) - len(done)
+        status.update({"stage": "done", "running": False, "checklist": None, "detail": "",
+                       "finished_at": datetime.now().isoformat(timespec="seconds"),
+                       "message": f"Готово: проверено чек-листов {len(done)}"
+                                  + (f", с ошибкой {failed}" if failed else "")})
+    except Exception as e:
+        print(f"[job {session_id}] ошибка: {e}")
+        status.update({"stage": "error", "running": False, "error": str(e)[:500],
+                       "message": f"Ошибка: {str(e)[:200]}",
+                       "finished_at": datetime.now().isoformat(timespec="seconds")})
+    finally:
+        _status_local.status = None
+
+
+def _existing_session(session_id: str) -> Path:
     if not _SESSION_ID_RE.match(session_id or ""):
         raise HTTPException(status_code=400, detail="Некорректный session_id")
     sdir = UPLOAD_DIR / session_id
     if not sdir.is_dir():
-        raise HTTPException(status_code=400, detail="Сессия не найдена")
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    return sdir
 
-    # Проверяем наличие загруженных файлов в папке сессии
-    docx_files = list(sdir.glob("*.docx"))
-    docm_files = list(sdir.glob("*.docm"))
-    pdf_files = list(sdir.glob("*.pdf"))
-    xlsx_files = list(sdir.glob("*.xlsx"))
-    all_docs = docx_files + docm_files + pdf_files + xlsx_files
 
-    if not all_docs:
-        raise HTTPException(status_code=400, detail="Нет загруженных документов")
+class AnalyzeRequest(BaseModel):
+    overrides: dict[str, str] = {}        # {файл: тип документа} — исправления пользователя
+    choices: dict[str, list[str]] = {}    # {бланк: [проверяемые файлы]} — выбор из нескольких
 
-    # Поле 2 (проверяемый документ: План аудита или Сводный акт) обязательно.
-    if not plan_doc_file:
-        raise HTTPException(
-            status_code=400,
-            detail="Не загружен проверяемый документ (поле 2). Без него сверка невозможна — пайплайн остановлен."
-        )
 
-    # === Чек-листы из поля 1: один или два. Определяем тип каждого. ===
-    checklist_names = [template_file] + ([template_file_2] if template_file_2 else [])
-    checklist_files = []
-    for name in checklist_names:
-        cpath = sdir / name
-        if not cpath.exists():
-            possible_names = ["ИИ шаблон плана.docm", "ИИ -ЧК -План АУДИТА.docx", "ЧК -Сводный акт.docx"]
-            for alt in possible_names:
-                if (sdir / alt).exists():
-                    cpath = sdir / alt
-                    break
-            else:
-                raise HTTPException(status_code=400, detail=f"Чек-лист '{name}' не найден в сессии")
-        ctype = checklists.detect_checklist_type(str(cpath))
-        checklist_files.append({"name": cpath.name, "path": cpath, "type": ctype})
-        print(f"Чек-лист '{cpath.name}' → тип: {ctype}")
+class RunRequest(AnalyzeRequest):
+    checklists: list[str]                 # бланки (поле 1), которые проверить
+    api_key: str = ""                     # пусто — ключ из настроек сервера
 
-    recognized = [c for c in checklist_files
-                  if checklists.CHECKLIST_BY_KEY.get(c["type"], {}).get("supported")]
-    # Распознанные, но ещё не подключённые чек-листы (Акт, ПН, ПКД…) не гоняем чужими
-    # правилами — раньше они определялись как «План» и проверялись его правилами.
-    not_supported = [c for c in checklist_files
-                     if c["type"] in checklists.CHECKLIST_BY_KEY and c not in recognized]
-    skipped_note = "; ".join(
-        f"«{checklists.CHECKLIST_BY_KEY[c['type']]['title']}» ({c['name']}) — "
-        f"проверка подключается на этапе {checklists.CHECKLIST_BY_KEY[c['type']]['stage']}"
-        for c in not_supported
-    )
-    if not recognized:
-        if not_supported:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Чек-лист распознан, но его проверка ещё не подключена: {skipped_note}. "
-                       f"Сейчас поддерживаются «План АУДИТА» и «Сводный акт»."
-            )
-        raise HTTPException(
-            status_code=400,
-            detail="Не удалось распознать тип чек-листа в поле 1 (ожидался «План АУДИТА» или «Сводный акт»)."
-        )
-    # Порядок обработки: сначала План, затем Сводный акт
-    recognized.sort(key=lambda c: 0 if c["type"] == "plan" else 1)
 
-    # Источники (поле 3) — всё, кроме самих чек-листов. Должен быть хотя бы 1 файл
-    # помимо проверяемого документа из поля 2.
-    checklist_set = {c["name"] for c in checklist_files}
-    field2_set = {f for f in (plan_doc_file, plan_doc_file_2) if f}
-    # Шаблоны чек-листов, которые лежат в сессии, но не выбраны в поле 1, — тоже не
-    # источники: иначе «Чек лист Акт» по содержимому находится как Акт аудита.
-    stray_checklists = {
-        d.name for d in all_docs
-        if d.name not in checklist_set | field2_set
-        and d.suffix.lower() in (".docx", ".docm")
-        and checklists.detect_checklist_type(str(d)) != "unknown"
-    }
-    if stray_checklists:
-        print(f"Шаблоны чек-листов не используются как источники: {sorted(stray_checklists)}")
-    checklist_set |= stray_checklists
-    excluded_names = checklist_set | field2_set
-    sources_count = sum(1 for d in all_docs if d.name not in excluded_names)
-    if sources_count == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Нет файлов-источников в поле 3. Загрузите Договор, Приказ ЭГ, Заявку и пр. — без них сверка невозможна."
-        )
-
-    # Извлекаем текст из всех документов КРОМЕ чек-листов.
-    # ВАЖНО: эта работа CPU-bound (особенно OCR) — выносим в thread, иначе блокируется
-    # event loop и /api/status перестаёт отвечать (фронт не видит прогресс).
+@app.post("/api/sessions/{session_id}/analyze")
+async def analyze_session(session_id: str, req: Optional[AnalyzeRequest] = None):
+    """Разбор пакета: тип каждого бланка и документа, организации, какие чек-листы можно
+    запустить и с какими документами, предупреждения. Прогресс чтения файлов — в
+    /api/sessions/{id}/status (поле analysis)."""
     import asyncio
-
-    source_docs = [d for d in all_docs if d.name not in checklist_set]
-    total_files = len(source_docs)
-    processing_status.update({
-        "stage": "extract",
-        "current": 0,
-        "total": total_files,
-        "message": f"Извлечение текста из {total_files} файлов",
-        "detail": "",
-    })
-
-    EXTRACT_WORKERS = 3
-
-    def _extract_one(doc_file: Path):
-        """Извлечь текст одного файла. Возвращает (filename, text) или (filename, None) при ошибке."""
-        suffix = doc_file.suffix.lower()
-        try:
-            if suffix in ('.docx', '.docm'):
-                text = extract_text_from_docx(str(doc_file))
-            elif suffix == '.pdf':
-                text = extract_text_from_pdf(str(doc_file))
-            elif suffix == '.xlsx':
-                text = extract_text_from_xlsx(str(doc_file))
-            else:
-                print(f"Пропущен файл {doc_file.name} — неподдерживаемый формат")
-                return (doc_file.name, None)
-            return (doc_file.name, text)
-        except Exception as e:
-            print(f"ERR Ошибка чтения {doc_file.name}: {e}")
-            return (doc_file.name, None)
-
-    def _extract_all_texts_parallel():
-        """Параллельное извлечение в пуле потоков (3 файла одновременно)."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading
-
-        all_texts = {}
-        analyzed_files = []
-        in_progress = set()
-        lock = threading.Lock()
-        completed = 0
-
-        def update_status():
-            with lock:
-                names = ", ".join(sorted(in_progress)[:3])
-                processing_status.update({
-                    "stage": "extract",
-                    "current": completed,
-                    "total": total_files,
-                    "message": f"Файлы {completed}/{total_files} (параллельно x{EXTRACT_WORKERS})",
-                    "detail": f"в обработке: {names}" if names else "",
-                })
-
-        with ThreadPoolExecutor(max_workers=EXTRACT_WORKERS) as ex:
-            future_to_file = {}
-            for doc_file in source_docs:
-                fut = ex.submit(_extract_one, doc_file)
-                future_to_file[fut] = doc_file
-                with lock:
-                    in_progress.add(doc_file.name[:60])
-
-            update_status()
-
-            for fut in as_completed(future_to_file):
-                doc_file = future_to_file[fut]
-                fname, text = fut.result()
-                with lock:
-                    in_progress.discard(doc_file.name[:60])
-                    completed += 1
-                    if text is not None:
-                        all_texts[fname] = text
-                        analyzed_files.append(fname)
-                        print(f"OK Проанализирован ({completed}/{total_files}): {fname}")
-                update_status()
-
-        return all_texts, analyzed_files
-
-    all_texts, analyzed_files = await asyncio.to_thread(_extract_all_texts_parallel)
-
-    print(f"\nВсего проанализировано файлов: {len(analyzed_files)}")
-    print(f"Файлы: {analyzed_files}\n")
-    doc_type_map = doc_types.classify_all(all_texts)
-    print(f"Типы документов: {doc_type_map}\n")
-
-    processing_status.update({
-        "stage": "extract",
-        "current": total_files,
-        "total": total_files,
-        "message": "Чтение проверяемого документа (поле 2)...",
-        "detail": "",
-    })
-
-    def _read_doc(p: Path) -> str:
-        suffix = p.suffix.lower()
-        if suffix in ('.docx', '.docm'):
-            return extract_text_from_docx(str(p))
-        elif suffix == '.pdf':
-            return extract_text_from_pdf(str(p))
-        elif suffix == '.xlsx':
-            return extract_text_from_xlsx(str(p))
-        return ""
-
-    # Проверяемые документы из поля 2 (1 или 2 файла: План аудита и/или Сводный акт).
-    field2_files = [plan_doc_file] + ([plan_doc_file_2] if plan_doc_file_2 else [])
-    field2_texts = []  # [(name, text), ...]
-    for name in field2_files:
-        p = sdir / name
-        if not p.exists():
-            raise HTTPException(status_code=400, detail=f"Файл (поле 2) '{name}' не найден в сессии")
-        try:
-            txt = await asyncio.to_thread(_read_doc, p)
-        except Exception as e:
-            print(f"WARN: Не удалось прочитать документ поля 2 {name}: {e}")
-            txt = ""
-        field2_texts.append((name, txt))
-
-    # Распределяем по типу: Сводный акт vs остальное (План аудита).
-    field2_svod_text = ""
-    field2_plan_text = ""
-    for name, txt in field2_texts:
-        if _looks_like_svod_doc(txt):
-            if not field2_svod_text:
-                field2_svod_text = txt
-        elif not field2_plan_text:
-            field2_plan_text = txt
-    # Фолбэк: если План не распознан, берём первый файл поля 2.
-    if not field2_plan_text and field2_texts:
-        field2_plan_text = field2_texts[0][1]
-
-    # Активная модель из настроек (с фолбэком на дефолт)
-    active_model = _get_active_model()
-    active_scope = _get_active_scope()
-
-    # Pre-flight: быстрая проверка GigaChat. Если auth/связь упали — ошибаемся сразу.
-    processing_status.update({
-        "stage": "preflight",
-        "current": 0,
-        "total": 1,
-        "message": f"Проверка соединения с GigaChat ({active_model})...",
-        "detail": "",
-    })
-    print("Preflight GigaChat...")
-    preflight = await asyncio.to_thread(gigachat_preflight, api_key, 8.0, active_model, active_scope)
-    if not preflight["ok"]:
-        raise HTTPException(
-            status_code=503,
-            detail=f"GigaChat недоступен ({preflight['stage']}): {preflight['detail']}"
-        )
-    print(f"Preflight OK. Доступные модели: {preflight['models']}")
-
-    def _normalize_counts(extracted: dict, structure: list):
-        """Приводим число результатов к числу пунктов чек-листа (обрезка/дополнение)."""
-        if "checklist" not in extracted:
-            return
-        actual = extracted["checklist"]
-        n = len(structure)
-        if len(actual) > n:
-            print(f"GigaChat вернул {len(actual)} пунктов, в документе {n}. Обрезано.")
-            extracted["checklist"] = actual[:n]
-        elif len(actual) < n:
-            for i in range(len(actual), n):
-                area_name = structure[i]['area'][:60] if i < len(structure) else f"пункт {i+1}"
-                extracted["checklist"].append({
-                    "ok": False, "nok": True,
-                    "reason": f"Нет данных для проверки: {area_name}",
-                    "problems": f"Нет данных для проверки: {area_name}",
-                    "ii_data_found": "",
-                })
-        for item in extracted["checklist"]:
-            item.setdefault("reason", item.get("problems", ""))
-            item.setdefault("ii_data_found", "")
-
-    session_out_dir = OUTPUT_DIR / session_id
-    session_out_dir.mkdir(parents=True, exist_ok=True)
-
-    outputs = []
-    first_extracted = None
-    first_validation = None
-
-    # === Обрабатываем каждый распознанный чек-лист (План → Сводный акт) ===
-    for c in recognized:
-        cpath = c["path"]
-        ctype = c["type"]
-        print(f"Запуск пайплайна для чек-листа '{cpath.name}' (тип {ctype}, модель {active_model})...")
-
-        if ctype == "plan":
-            # Проверяемый документ для Плана = файл поля 2, распознанный как План аудита
-            plan_doc_text = field2_plan_text
-            if not plan_doc_text or len(plan_doc_text.strip()) < 100:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Не удалось извлечь текст «Плана аудита» из поля 2. "
-                        f"Прочитано символов: {len(plan_doc_text.strip()) if plan_doc_text else 0}. "
-                        "Проверьте, что в поле 2 загружен правильный файл с Планом аудита."
-                    )
-                )
-            try:
-                template_text = await asyncio.to_thread(extract_text_from_docx, str(cpath))
-            except Exception as e:
-                print(f"WARN: текст шаблона Плана не извлечён: {e}")
-                template_text = ""
-            checklist_structure = checklists.parse_checklist(str(cpath))
-            ii_references = extract_ii_references(str(cpath))
-            print(f"[План] маркеры ИИ: {list(ii_references.keys())}, пунктов: {len(checklist_structure)}")
-
-            try:
-                extracted_data = await asyncio.to_thread(
-                    process_checklist_advanced,
-                    api_key, all_texts, checklist_structure, ii_references, active_model,
-                    plan_doc_text, doc_type_map
-                )
-            except Exception as e:
-                processing_status.update({"stage": "error", "message": str(e)[:200]})
-                return ProcessingResult(status="error", message=f"Ошибка пайплайна (План): {str(e)}")
-            if "error" in extracted_data:
-                return ProcessingResult(status="error", message=extracted_data["error"])
-
-            _normalize_counts(extracted_data, checklist_structure)
-
-            output_filename = "Заполненный_План_АУДИТА.docx"
-            output_path = session_out_dir / output_filename
-            output_ref = f"{session_id}/{output_filename}"
-            processing_status.update({"stage": "fill", "message": "Заполнение Плана АУДИТА...", "detail": ""})
-            try:
-                await asyncio.to_thread(
-                    fill_plan_with_checklist,
-                    str(cpath), extracted_data, str(output_path), checklist_structure
-                )
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Ошибка заполнения Плана: {str(e)}")
-
-            processing_status.update({"stage": "validate", "message": "Валидация Плана...", "detail": ""})
-            validation = await validate_result(output_ref)
-
-            # Доп. сверка наименования юр.лица (План vs источники)
-            try:
-                applicant_check = await asyncio.to_thread(
-                    cross_check_applicant_name, api_key, plan_doc_text, all_texts, active_model
-                )
-            except Exception as e:
-                print(f"WARN: cross-check заявителя не выполнен: {e}")
-                applicant_check = None
-            if applicant_check and applicant_check.get("match") is False:
-                note = (
-                    f"Наименование заявителя в Плане и в источниках различается. "
-                    f"План (поле 2): «{applicant_check.get('plan_name') or '—'}». "
-                    f"Источники (поле 3): «{applicant_check.get('sources_name') or '—'}»."
-                )
-                if applicant_check.get("note"):
-                    note += f" {applicant_check['note']}"
-                notes = list(validation.get("notes") or [])
-                notes.append(note)
-                validation["notes"] = notes
-                validation["applicant_check"] = applicant_check
-
-        else:  # ctype == "svod"
-            # Проверяемый документ для Сводного акта = файл поля 2, распознанный как
-            # Сводный акт; иначе ищем среди источников (поле 3).
-            svod_doc_text = field2_svod_text
-            if not svod_doc_text:
-                for fn, txt in all_texts.items():
-                    if _looks_like_svod_doc(txt):
-                        svod_doc_text = txt
-                        print(f"[Сводный акт] проверяемый документ найден среди источников: {fn}")
-                        break
-            if not svod_doc_text or len(svod_doc_text.strip()) < 100:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Не найден проверяемый документ «Сводный акт исследования (итог)». "
-                        "Загрузите его в поле 2 либо в поле 3 (источники)."
-                    )
-                )
-            checklist_structure = checklists.parse_checklist(str(cpath))
-            print(f"[Сводный акт] пунктов: {len(checklist_structure)}")
-
-            try:
-                extracted_data = await asyncio.to_thread(
-                    process_checklist_svod,
-                    api_key, all_texts, checklist_structure, active_model, svod_doc_text
-                )
-            except Exception as e:
-                processing_status.update({"stage": "error", "message": str(e)[:200]})
-                return ProcessingResult(status="error", message=f"Ошибка пайплайна (Сводный акт): {str(e)}")
-
-            _normalize_counts(extracted_data, checklist_structure)
-
-            output_filename = "Заполненный_Сводный_акт.docx"
-            output_path = session_out_dir / output_filename
-            output_ref = f"{session_id}/{output_filename}"
-            processing_status.update({"stage": "fill", "message": "Заполнение Сводного акта...", "detail": ""})
-            try:
-                await asyncio.to_thread(
-                    fill_svod_with_checklist,
-                    str(cpath), extracted_data, str(output_path), checklist_structure
-                )
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Ошибка заполнения Сводного акта: {str(e)}")
-
-            # Лёгкая валидация: счётчики (validate_result заточен под План)
-            results = extracted_data.get("checklist", [])
-            validation = {
-                "valid": True,
-                "issues": [],
-                "notes": [],
-                "ok_count": sum(1 for it in results if it.get("ok")),
-                "nok_count": sum(1 for it in results if it.get("nok")),
-                "manual_count": sum(1 for it in results if not it.get("ok") and not it.get("nok")),
-                "total": len(results),
-            }
-
-        # Сводка по этому чек-листу
-        results = extracted_data.get("checklist", []) if isinstance(extracted_data, dict) else []
-        outputs.append({
-            "type": ctype,
-            "checklist_file": cpath.name,
-            "output_file": output_ref,
-            "ok_count": sum(1 for it in results if it.get("ok")),
-            "nok_count": sum(1 for it in results if it.get("nok")),
-            "manual_count": sum(1 for it in results if not it.get("ok") and not it.get("nok")),
-            "total_items": len(results),
-            "header": extracted_data.get("header") if isinstance(extracted_data, dict) else None,
-            "checklist": results,
-            "validation": validation,
-        })
-        if first_extracted is None:
-            first_extracted = extracted_data
-            first_validation = validation
-
-    # === Сохраняем мета-данные сессии для админки ===
+    sdir = _existing_session(session_id)
+    req = req or AnalyzeRequest()
+    progress = _analysis_status(session_id)
     try:
-        first = outputs[0] if outputs else {}
-        _save_session_meta(
-            session_id,
-            finished_at=datetime.now().isoformat(timespec="seconds"),
-            template_file=template_file,
-            template_file_2=template_file_2,
-            plan_doc_file=plan_doc_file,
-            plan_doc_file_2=plan_doc_file_2,
-            source_files=[d.name for d in source_docs if d.name not in field2_set],
-            document_types=doc_type_map,
-            output_file=first.get("output_file"),
-            outputs=outputs,
-            model=active_model,
-            ok_count=first.get("ok_count"),
-            nok_count=first.get("nok_count"),
-            total_items=first.get("total_items"),
-            header=first_extracted.get("header") if isinstance(first_extracted, dict) else None,
-            checklist=first_extracted.get("checklist") if isinstance(first_extracted, dict) else None,
-            validation=first_validation,
-        )
-    except Exception as e:
-        print(f"WARN: meta сохранить не удалось: {e}")
+        analysis, _ = await asyncio.to_thread(
+            _analyze_session, session_id, sdir, req.overrides, req.choices, progress)
+    finally:
+        progress.update({"stage": "idle", "message": "", "detail": ""})
+    return analysis
 
-    types_done = ", ".join("Сводный акт" if o["type"] == "svod" else "План АУДИТА" for o in outputs)
-    message = f"Обработано чек-листов: {len(outputs)} ({types_done}). Проанализировано файлов: {len(analyzed_files)}"
-    if skipped_note:
-        message += f". Пропущены: {skipped_note}"
-    return ProcessingResult(
-        status="success",
-        message=message,
-        extracted_data=first_extracted,
-        output_file=outputs[0]["output_file"] if outputs else None,
-        outputs=outputs,
-        validation=first_validation,
-        analyzed_files=analyzed_files,
-        document_types=doc_type_map,
-    )
+
+@app.post("/api/sessions/{session_id}/run")
+async def run_session(session_id: str, req: RunRequest):
+    """Запуск проверки выбранных чек-листов в фоне. Результаты — в /api/sessions/{id}/status."""
+    sdir = _existing_session(session_id)
+    if not req.checklists:
+        raise HTTPException(status_code=400, detail="Не выбран ни один чек-лист")
+    llm = [n for n in req.checklists
+           if checklists.detect_checklist_type(str(sdir / n)) in package.LLM_CHECKLISTS]
+    api_key = (req.api_key or "").strip() or _load_settings().get("api_key", "")
+    if llm and not api_key:
+        raise HTTPException(status_code=400,
+                            detail="Для проверки Плана АУДИТА и Сводного акта нужен ключ GigaChat — "
+                                   "сохраните его в «Админ».")
+    status = _job_status(session_id)
+    with _JOBS_LOCK:
+        if status["running"]:
+            raise HTTPException(status_code=409, detail="Проверка этого пакета уже идёт")
+        status.clear()
+        status.update(_new_status())
+        status.update({"running": True, "stage": "start", "message": "Запуск проверки…",
+                       "started_at": datetime.now().isoformat(timespec="seconds")})
+    threading.Thread(target=_run_package_job, daemon=True,
+                     args=(session_id, sdir, api_key, req.checklists, req.overrides, req.choices)).start()
+    return {"status": "started"}
+
+
+@app.get("/api/sessions/{session_id}/status")
+async def session_status(session_id: str):
+    """Ход и результаты проверки сессии. После перезапуска сервера — результаты из meta."""
+    _existing_session(session_id)
+    status = dict(_job_status(session_id))
+    if not status["running"] and not status["outputs"]:
+        meta = _load_session_meta(session_id)
+        if meta.get("outputs"):
+            status.update({"stage": "done", "outputs": meta["outputs"],
+                           "finished_at": meta.get("finished_at")})
+    status["analysis"] = dict(_analysis_status(session_id))
+    return status
 
 
 @app.get("/api/admin/sessions")
@@ -5333,7 +5182,7 @@ async def admin_list_sessions(limit: int = 50):
             "total_items": meta.get("total_items"),
             "model": meta.get("model"),
             "output_file": meta.get("output_file"),
-            "applicant": (meta.get("header") or {}).get("Наименование Заявителя") if meta.get("header") else None,
+            "applicant": meta.get("applicant") or (meta.get("header") or {}).get("Наименование Заявителя"),
         })
     items.sort(key=lambda x: x.get("ts_sort") or "", reverse=True)
     return {"sessions": items[:limit], "total": len(items)}
@@ -5521,11 +5370,16 @@ async def delete_file(filename: str, session_id: Optional[str] = None):
     """Удаление загруженного файла из папки сессии."""
     if not session_id or not _SESSION_ID_RE.match(session_id):
         raise HTTPException(status_code=400, detail="Некорректный session_id")
-    file_path = UPLOAD_DIR / session_id / filename
-    if file_path.exists():
-        file_path.unlink()
-        return {"status": "ok", "message": f"Файл {filename} удален"}
-    raise HTTPException(status_code=404, detail="Файл не найден")
+    sdir = (UPLOAD_DIR / session_id).resolve()
+    file_path = (sdir / filename).resolve()
+    if file_path.parent != sdir or filename.startswith("_") or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    file_path.unlink()
+    meta = _load_session_meta(session_id)
+    if meta.get("blocks"):
+        _save_session_meta(session_id, blocks={k: [n for n in v if n != filename]
+                                               for k, v in meta["blocks"].items()})
+    return {"status": "ok", "message": f"Файл {filename} удален"}
 
 
 @app.post("/api/upload-from-path")
@@ -5568,12 +5422,6 @@ async def upload_from_path(
         _save_session_meta(sid, blocks=blocks)
 
     return {"status": "ok", "session_id": sid, "uploaded_files": uploaded, "count": len(uploaded)}
-
-
-@app.get("/api/status")
-def get_processing_status():
-    """Текущий статус обработки (для polling из UI во время /api/process)."""
-    return processing_status
 
 
 @app.get("/api/gigachat/diagnose")

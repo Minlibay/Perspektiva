@@ -28,9 +28,11 @@ def test_template_type_and_items(checklist_path, name, ctype, count):
     assert all(it["area"] for it in items)
 
 
-def test_only_plan_and_svod_supported():
+def test_supported_checklists():
     supported = {c["key"] for c in checklists.CHECKLIST_TYPES if c["supported"]}
-    assert supported == {"plan", "svod"}
+    # этап 0 — План и Сводный акт, этапы 1–3 — чек-листы «по формулам»: подключены все 11
+    assert supported == {c["key"] for c in checklists.CHECKLIST_TYPES}
+    assert len(supported) == 11
 
 
 def test_plan_2026_columns_found_by_headers(checklist_path):
