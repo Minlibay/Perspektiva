@@ -9,6 +9,7 @@ import shutil
 import json
 import uuid
 import re
+import threading
 from datetime import datetime
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -24,6 +25,19 @@ from docx.shared import Pt, Inches
 import tempfile
 from PyPDF2 import PdfReader
 import openpyxl
+
+import checklists
+import doc_types
+import formula_checks
+import package
+from checklists import open_docx as _open_docx_or_docm
+from fields import (
+    add_workdays as _add_workdays,
+    exclusion_block as _exclusion_block,
+    exclusion_clauses as _exclusion_clauses,
+    normalize_org_name as _normalize_applicant_name,
+    ru_month as _ru_month,
+)
 
 app = FastAPI(title="Audit Plan Filler", version="1.0.0")
 
@@ -141,32 +155,75 @@ def _get_active_scope() -> str:
     """Активный OAuth scope: из настроек, иначе DEFAULT_GIGACHAT_SCOPE."""
     return (_load_settings().get("scope") or "").strip() or DEFAULT_GIGACHAT_SCOPE
 
-# Глобальный статус обработки — для опроса прогресса из UI
-processing_status = {
-    "stage": "idle",        # idle | header | verify | done | error
-    "current": 0,           # текущий пункт чек-листа
-    "total": 0,             # всего пунктов
-    "message": "",          # текст для отображения
-    "detail": "",           # подробность (файлы, этап)
-}
+# Статус обработки — у каждой сессии свой (раньше был один словарь на весь сервер, и при
+# двух пользователях каждый видел прогресс чужой проверки).
+def _new_status() -> dict:
+    return {
+        "stage": "idle",        # idle | extract | preflight | header | verify | fill | validate | done | error
+        "current": 0,           # текущий пункт / файл
+        "total": 0,             # всего пунктов / файлов
+        "message": "",          # текст для отображения
+        "detail": "",           # подробность (файлы, этап)
+        "running": False,       # идёт фоновая проверка
+        "checklist": None,      # чек-лист, который проверяется сейчас
+        "outputs": [],          # готовые результаты — появляются по мере проверки
+        "error": None,
+        "started_at": None,
+        "finished_at": None,
+    }
 
+
+_JOBS: dict = {}            # session_id → статус проверки
+_ANALYSIS: dict = {}        # session_id → прогресс чтения файлов при разборе пакета
+_SESSION_LOCKS: dict = {}   # session_id → блокировка кэша текстов
+_JOBS_LOCK = threading.Lock()
+_status_local = threading.local()
+_FALLBACK_STATUS = _new_status()
+
+
+def _job_status(session_id: str) -> dict:
+    with _JOBS_LOCK:
+        return _JOBS.setdefault(session_id, _new_status())
+
+
+def _analysis_status(session_id: str) -> dict:
+    with _JOBS_LOCK:
+        return _ANALYSIS.setdefault(session_id, {"stage": "idle", "current": 0, "total": 0,
+                                                 "message": "", "detail": ""})
+
+
+def _session_lock(session_id: str) -> threading.Lock:
+    with _JOBS_LOCK:
+        return _SESSION_LOCKS.setdefault(session_id, threading.Lock())
+
+
+class _StatusProxy:
+    """processing_status для пайплайнов Плана и Сводного акта: пишет в статус проверки,
+    которую выполняет текущий поток (_status_local.status)."""
+
+    def _target(self) -> dict:
+        return getattr(_status_local, "status", None) or _FALLBACK_STATUS
+
+    def update(self, *args, **kwargs):
+        self._target().update(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        self._target()[key] = value
+
+    def __getitem__(self, key):
+        return self._target()[key]
+
+    def get(self, key, default=None):
+        return self._target().get(key, default)
+
+
+processing_status = _StatusProxy()
 
 class GigaChatSettings(BaseModel):
     """Настройки подключения к GigaChat"""
     api_key: str
     model: Optional[str] = None
     scope: Optional[str] = None
-
-
-class ProcessingResult(BaseModel):
-    """Результат обработки"""
-    status: str
-    message: str
-    extracted_data: Optional[dict] = None
-    output_file: Optional[str] = None
-    validation: Optional[dict] = None
-    analyzed_files: Optional[list[str]] = None
-    outputs: Optional[list[dict]] = None  # по одному элементу на каждый обработанный чек-лист
 
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -324,27 +381,6 @@ def _collect_docx_part_text(part) -> list:
             if any(deduped):
                 out.append(" | ".join(deduped))
     return out
-
-
-def _open_docx_or_docm(file_path: str):
-    """python-docx падает на .docm (другой content-type main part).
-    Перепаковываем в памяти: меняем macroEnabled.main → document.main."""
-    suffix = Path(file_path).suffix.lower()
-    if suffix != ".docm":
-        return Document(file_path)
-    import zipfile
-    from io import BytesIO
-    src_macro = b"application/vnd.ms-word.document.macroEnabled.main+xml"
-    dst_main = b"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
-    buf = BytesIO()
-    with zipfile.ZipFile(file_path, "r") as zin, zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            data = zin.read(item.filename)
-            if item.filename == "[Content_Types].xml":
-                data = data.replace(src_macro, dst_main)
-            zout.writestr(item, data)
-    buf.seek(0)
-    return Document(buf)
 
 
 def extract_text_from_docx(file_path: str) -> str:
@@ -560,50 +596,14 @@ def fill_plan_template(template_path: str, source_texts: dict,
     return output_path
 
 
-def extract_checklist_from_template(template_path: str) -> list[dict]:
-    """Извлечение структуры чек-листа из шаблона"""
-    doc = Document(template_path)
-    checklist = []
-    
-    for table in doc.tables:
-        first_row = table.rows[0]
-        cells_text = [cell.text.strip() for cell in first_row.cells]
-        
-        # Ищем таблицу чек-листа (>=5 колонок, заголовок "Область проверки").
-        # Шаблон бывает на 5 колонок (старый) или 7 (добавились "Доки" и "№").
-        if len(first_row.cells) >= 5 and "Область проверки" in cells_text:
-            # Пропускаем заголовок, начинаем с row_idx=1
-            for row_idx, row in enumerate(table.rows[1:], start=1):
-                area = row.cells[0].text.strip()
-                comments = row.cells[1].text.strip()
-                problems_hint = row.cells[4].text.strip()
-                
-                # Извлекаем маркеры ИИ из комментариев
-                import re
-                ii_markers = re.findall(r'ИИ\d+', comments)
-                
-                if area:  # Пропускаем пустые строки
-                    checklist.append({
-                        "row_index": row_idx,
-                        "area": area,
-                        "comments": comments,
-                        "problems_hint": problems_hint,
-                        "ii_markers": ii_markers  # ['ИИ1', 'ИИ2'] и т.д.
-                    })
-            break  # Нашли таблицу чек-листа, больше не ищем
-    
-    return checklist
-
-
 def extract_ii_references(template_path: str) -> dict:
     """
     Извлечение всех маркеров ИИ из шаблона и их контекста.
     Возвращает словарь: {"ИИ1": "текст рядом", "ИИ2": "текст рядом", ...}
     """
-    import re
-    doc = Document(template_path)
+    doc = _open_docx_or_docm(template_path)
     ii_refs = {}
-    
+
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -621,45 +621,6 @@ def extract_ii_references(template_path: str) -> dict:
     return ii_refs
 
 
-def detect_checklist_type(template_path: str) -> str:
-    """
-    Детерминированно определяет тип чек-листа по структуре таблиц.
-      'plan' — «ИИ -ЧК -План АУДИТА»: есть таблица с заголовком «Область проверки».
-      'svod' — «ЧК -Сводный акт»: одна таблица 6 колонок с заголовком №/.../ОК/NOK/
-               «Проблемные зоны» и строкой-титулом «СВОДНЫЙ АКТ».
-      'unknown' — структура не распознана.
-    """
-    try:
-        doc = _open_docx_or_docm(template_path)
-    except Exception as e:
-        print(f"[detect] не удалось открыть {template_path}: {e}")
-        return "unknown"
-
-    for table in doc.tables:
-        if not table.rows:
-            continue
-        header_cells = [c.text.strip() for c in table.rows[0].cells]
-        if any("Область проверки" in c for c in header_cells):
-            return "plan"
-
-    # Признаки Сводного акта: 6 колонок, в шапке «Проблемные зоны», и где-то
-    # в первых строках титул «СВОДНЫЙ АКТ».
-    for table in doc.tables:
-        if not table.rows or len(table.rows[0].cells) < 6:
-            continue
-        header_cells = [c.text.strip() for c in table.rows[0].cells]
-        has_problem_col = any("Проблемные зоны" in c for c in header_cells)
-        first_rows_text = " ".join(
-            c.text.strip().upper()
-            for row in table.rows[:3]
-            for c in row.cells
-        )
-        if has_problem_col and "СВОДНЫЙ АКТ" in first_rows_text:
-            return "svod"
-
-    return "unknown"
-
-
 def _looks_like_svod_doc(text: str) -> bool:
     """Эвристика: похож ли текст на «Сводный акт исследования» (главный проверяемый
     документ для чек-листа Сводного акта)."""
@@ -673,98 +634,62 @@ def _looks_like_svod_doc(text: str) -> bool:
     )
 
 
-def extract_checklist_svod(template_path: str) -> list[dict]:
-    """
-    Извлечение пунктов чек-листа «Сводный акт».
-    Структура таблицы: [№ | Наименование | Критерий | ОК | NOK | Проблемные зоны].
-    Строки-пункты — те, где в колонке № стоит число (1..N).
-    Возвращает список в том же формате, что и план-чек-лист, плюс поля для
-    заполнения колонок ОК/NOK (table_index / row_index) и подсказку источника.
-    """
-    doc = _open_docx_or_docm(template_path)
-    checklist = []
-
-    for t_idx, table in enumerate(doc.tables):
-        if not table.rows or len(table.rows[0].cells) < 6:
-            continue
-        header_cells = [c.text.strip() for c in table.rows[0].cells]
-        if not any("Проблемные зоны" in c for c in header_cells):
-            continue
-
-        for row_idx, row in enumerate(table.rows):
-            cells = row.cells
-            if len(cells) < 6:
-                continue
-            num = cells[0].text.strip()
-            if not re.match(r"^\d+$", num):
-                continue  # пропускаем шапку и пустые строки
-            area = cells[1].text.strip()
-            criterion = cells[2].text.strip()
-            source_hint = cells[5].text.strip()
-            if not area:
-                continue
-            checklist.append({
-                "item_no": int(num),
-                "table_index": t_idx,
-                "row_index": row_idx,
-                "area": area,
-                # criterion кладём в comments — verify_item_strict печатает «комментарии»
-                "comments": criterion,
-                "problems_hint": source_hint,
-                "source_hint": source_hint,
-                "ii_markers": [],  # в Сводном акте маркеров ИИ\d+ нет
-            })
-        if checklist:
-            break  # нашли таблицу чек-листа
-
-    return checklist
-
-
 def fill_svod_with_checklist(template_path: str, extracted_data: dict, output_path: str,
                               checklist_structure: list[dict] = None) -> str:
     """
-    Заполнение «ЧК -Сводный акт»: проставляем отметку в колонке ОК (col3) или
-    NOK (col4) и пишем текст в «Проблемные зоны» (col5). Шапки Заявителя в этом
-    чек-листе нет — заполняем только строки пунктов по их row_index.
+    Заполнение «ЧК -Сводный акт»: отметка «V» в колонке ОК или NOK и обоснование
+    в «Проблемные зоны». Шапки Заявителя в этом чек-листе нет. Пункт без вердикта
+    («проверить вручную») остаётся с пустыми ОК/NOK.
     """
-    shutil.copy2(template_path, output_path)
-    doc = Document(output_path)
-
-    checklist_data = extracted_data.get("checklist", [])
-    if not checklist_structure:
-        checklist_structure = extract_checklist_svod(output_path)
-
-    # Таблица чек-листа — та, что хранит структуру (table_index одинаков у всех пунктов)
-    if not checklist_structure:
-        doc.save(output_path)
-        return output_path
-    t_index = checklist_structure[0].get("table_index", 0)
-    table = doc.tables[t_index]
-
-    def _set_cell(cell, text):
-        for para in cell.paragraphs:
-            para.clear()
-        run = cell.paragraphs[0].add_run(text)
-        run.font.size = Pt(10)
-
-    for struct, res in zip(checklist_structure, checklist_data):
-        r_idx = struct.get("row_index")
-        if r_idx is None or r_idx >= len(table.rows):
-            continue
-        row = table.rows[r_idx]
-        if len(row.cells) < 6:
-            continue
-        is_ok = bool(res.get("ok")) and not bool(res.get("nok"))
-        is_nok = bool(res.get("nok")) and not bool(res.get("ok"))
-        # Колонки ОК=3, NOK=4. Ручной пункт (ни ok, ни nok) — обе клетки пустые.
-        _set_cell(row.cells[3], "V" if is_ok else "")
-        _set_cell(row.cells[4], "V" if is_nok else "")
-        reason = (res.get("reason") or res.get("problems") or "").strip()
-        if reason:
-            _set_cell(row.cells[5], reason)
-
+    doc = _open_docx_or_docm(template_path)
+    items = checklist_structure or checklists.parse_checklist(doc)
+    checklists.write_marks(doc, items, extracted_data.get("checklist", []),
+                           ok_mark="V", nok_mark="V", write_reason=True, mark_size=10)
     doc.save(output_path)
     return output_path
+
+
+def fill_formula_checklist(template_path: str, extracted_data: dict, output_path: str,
+                           checklist_structure: list[dict] = None) -> str:
+    """Заполнение чек-листов «по формулам» (ПКД, Отчет КД, ПН, Листы оценки): «V» в ОК
+    или NOK и обоснование в последней колонке (в шаблоне там подсказка-источник)."""
+    doc = _open_docx_or_docm(template_path)
+    items = checklist_structure or checklists.parse_checklist(doc)
+    checklists.write_marks(doc, items, extracted_data.get("checklist", []),
+                           ok_mark="V", nok_mark="V", write_reason=True, mark_size=10)
+    doc.save(output_path)
+    return output_path
+
+
+def _fill_plan_header(doc, header_data: dict) -> None:
+    """Шапка Плана АУДИТА (таблица в 2 колонки): Заявитель, Вид аудита, Даты, РЭГ —
+    значение пишется в пустую ячейку строки."""
+    for table in doc.tables:
+        if not table.rows or len(table.rows[0].cells) != 2:
+            continue
+        for row in table.rows:
+            cells_text = [cell.text.strip() for cell in row.cells]
+            full_row_text = " ".join(cells_text)
+
+            if "Наименования Заявителя" in full_row_text:
+                field, min_len = "Наименование Заявителя", 5
+            elif "Вид аудита" in full_row_text and len(full_row_text) < 50:
+                field, min_len = "Вид аудита", 5
+            elif "Даты проведения" in full_row_text:
+                field, min_len = "Даты проведения", 5
+            elif full_row_text.strip() == "РЭГ" or ("РЭГ" in full_row_text and len(full_row_text) < 20):
+                field, min_len = "РЭГ", 3
+            else:
+                continue
+            if field not in header_data:
+                continue
+            for cell in row.cells:
+                if not cell.text.strip() or len(cell.text.strip()) < min_len:
+                    for para in cell.paragraphs:
+                        para.clear()
+                        run = para.add_run(header_data[field])
+                        run.font.size = Pt(10)
+                    break
 
 
 def fill_plan_with_checklist(template_path: str, extracted_data: dict, output_path: str,
@@ -772,119 +697,15 @@ def fill_plan_with_checklist(template_path: str, extracted_data: dict, output_pa
     """
     Заполнение шаблона Плана АУДИТА:
     - Шапка (Заявитель, Вид аудита, Даты, РЭГ)
-    - Таблица чек-листа: ТОЛЬКО колонки ОК/NOK (текст НЕ трогаем)
+    - Таблица чек-листа: ТОЛЬКО колонки ОК/NOK (☑ / ☒). Текст шаблона и колонку
+      «Проблемные зоны» (подсказки методолога) не трогаем.
+    Колонки ОК/NOK — по заголовкам таблицы (см. checklists.parse_checklist).
     """
-    shutil.copy2(template_path, output_path)
-    
-    doc = Document(output_path)
-    
-    checklist_data = extracted_data.get("checklist", [])
-    header_data = extracted_data.get("header", {})
-    
-    # Счётчик заполненных строк чек-листа
-    checklist_item_idx = 0
-    
-    for table in doc.tables:
-        # Определяем тип таблицы
-        first_row = table.rows[0]
-        first_cell_text = first_row.cells[0].text.strip()
-        cols_count = len(first_row.cells)
-        
-        # === ШАПКА (2 колонки) — заполняем ===
-        if cols_count == 2:
-            for row in table.rows:
-                cells_text = [cell.text.strip() for cell in row.cells]
-                full_row_text = " ".join(cells_text)
-                
-                if "Наименования Заявителя" in full_row_text:
-                    if "Наименование Заявителя" in header_data:
-                        for cell in row.cells:
-                            if not cell.text.strip() or len(cell.text.strip()) < 5:
-                                for para in cell.paragraphs:
-                                    para.clear()
-                                    run = para.add_run(header_data["Наименование Заявителя"])
-                                    run.font.size = Pt(10)
-                                break
-                
-                elif "Вид аудита" in full_row_text and len(full_row_text) < 50:
-                    if "Вид аудита" in header_data:
-                        for cell in row.cells:
-                            if not cell.text.strip() or len(cell.text.strip()) < 5:
-                                for para in cell.paragraphs:
-                                    para.clear()
-                                    run = para.add_run(header_data["Вид аудита"])
-                                    run.font.size = Pt(10)
-                                break
-                
-                elif "Даты проведения" in full_row_text:
-                    if "Даты проведения" in header_data:
-                        for cell in row.cells:
-                            if not cell.text.strip() or len(cell.text.strip()) < 5:
-                                for para in cell.paragraphs:
-                                    para.clear()
-                                    run = para.add_run(header_data["Даты проведения"])
-                                    run.font.size = Pt(10)
-                                break
-                
-                elif full_row_text.strip() == "РЭГ" or ("РЭГ" in full_row_text and len(full_row_text) < 20):
-                    if "РЭГ" in header_data:
-                        for cell in row.cells:
-                            if not cell.text.strip() or len(cell.text.strip()) < 3:
-                                for para in cell.paragraphs:
-                                    para.clear()
-                                    run = para.add_run(header_data["РЭГ"])
-                                    run.font.size = Pt(10)
-                                break
-        
-        # === ЧЕК-ЛИСТ (>=5 колонок, заголовок "Область проверки") ===
-        elif cols_count >= 5 and "Область проверки" in first_cell_text:
-            # Пропускаем заголовок (row_idx=0), начинаем с row_idx=1
-            for row in table.rows[1:]:
-                if checklist_item_idx >= len(checklist_data):
-                    break
-                
-                item = checklist_data[checklist_item_idx]
-                
-                # Колонки: 0=Область, 1=Комментарии, 2=ОК, 3=NOK, 4=Проблемные зоны
-                # ВАЖНО: Трогаем ТОЛЬКО колонки 2 (ОК) и 3 (NOK)
-                if len(row.cells) >= 5:
-                    # === Колонка ОК — ставим ОДИН маркер ===
-                    ok_cell = row.cells[2]
-                    # Полная очистка ячейки — удаляем всё содержимое
-                    for para in ok_cell.paragraphs:
-                        for run in para.runs:
-                            run.text = ""
-                        para.text = ""
-                    
-                    # Если OK — записываем маркер
-                    if item.get("ok"):
-                        # Убедимся что есть хотя бы один параграф
-                        if not ok_cell.paragraphs:
-                            ok_cell.add_paragraph()
-                        para = ok_cell.paragraphs[0]
-                        run = para.add_run("☑")
-                        run.font.size = Pt(11)
-                    
-                    # === Колонка NOK — ставим ОДИН маркер ===
-                    nok_cell = row.cells[3]
-                    # Полная очистка
-                    for para in nok_cell.paragraphs:
-                        for run in para.runs:
-                            run.text = ""
-                        para.text = ""
-                    
-                    # Если NOK — записываем маркер
-                    if item.get("nok"):
-                        if not nok_cell.paragraphs:
-                            nok_cell.add_paragraph()
-                        para = nok_cell.paragraphs[0]
-                        run = para.add_run("☒")
-                        run.font.size = Pt(11)
-                    
-                    # Колонки 0, 1, 4 НЕ ТРОГАЕМ — текст остаётся оригинальный из шаблона
-                
-                checklist_item_idx += 1
-    
+    doc = _open_docx_or_docm(template_path)
+    _fill_plan_header(doc, extracted_data.get("header", {}))
+    items = checklist_structure or checklists.parse_checklist(doc)
+    checklists.write_marks(doc, items, extracted_data.get("checklist", []),
+                           ok_mark="☑", nok_mark="☒")
     doc.save(output_path)
     return output_path
 
@@ -1330,53 +1151,6 @@ def extract_header_info(api_key: str, all_texts: dict, model: str = "GigaChat") 
             result[key] = "не найдено"
 
     return result
-
-
-_OPF_EXPANSIONS = [
-    ("публичное акционерное общество", "пао"),
-    ("непубличное акционерное общество", "нао"),
-    ("акционерное общество", "ао"),
-    ("общество с ограниченной ответственностью", "ооо"),
-    ("закрытое акционерное общество", "зао"),
-    ("открытое акционерное общество", "оао"),
-    ("индивидуальный предприниматель", "ип"),
-]
-
-
-def _normalize_applicant_name(name: str) -> tuple[str, str]:
-    """Нормализует наименование юр.лица.
-
-    Возвращает (opf, core) — токен ОПФ (ооо/ао/пао/...) и «ядро» (название без ОПФ, без кавычек/пробелов).
-    Любое отклонение в ОПФ (ПААО vs ПАО) или в ядре (Ромашкаа vs Ромашка) даст разные значения.
-    """
-    if not name:
-        return ("", "")
-    s = name.lower().strip()
-    # убираем все виды кавычек и лишние знаки
-    for ch in ['«', '»', '"', '"', '"', "'", '`', '(', ')', '\n', '\t']:
-        s = s.replace(ch, ' ')
-    # схлопываем пробелы
-    s = re.sub(r'\s+', ' ', s).strip()
-
-    # развёрнутая ОПФ → аббревиатура (сравниваем полные формы до коротких, чтобы «акционерное общество» не съело «публичное акционерное общество»)
-    opf = ""
-    for full, short in _OPF_EXPANSIONS:
-        if s.startswith(full + ' ') or s == full:
-            opf = short
-            s = s[len(full):].strip()
-            break
-    if not opf:
-        # Если ОПФ-аббревиатура — первое короткое «слово» (2–6 букв) перед названием.
-        # Сюда попадает и валидное «ПАО», и опечатки вида «ПААО» — то, что и нужно ловить.
-        parts = s.split(' ', 1)
-        head = parts[0]
-        if 2 <= len(head) <= 6 and head.isalpha():
-            opf = head
-            s = parts[1] if len(parts) > 1 else ''
-
-    # ядро — буквы и цифры (выкидываем пунктуацию и пробелы для устойчивого сравнения)
-    core = re.sub(r'[^0-9a-zа-яё]+', '', s)
-    return (opf, core)
 
 
 def cross_check_applicant_name(api_key: str, plan_text: str, sources_texts: dict,
@@ -2230,8 +2004,11 @@ def adversarial_recheck(api_key: str, item: dict, ii_references: dict,
         return prior_verdict
 
 
-# Правила обработки пунктов чек-листа.
-# Ключ — индекс пункта (0 = пункт 1 в плане), значение — словарь:
+# Правила обработки пунктов чек-листа «План АУДИТА».
+# Ключ — id правила (rid). Пункт шаблона сопоставляется с правилом ПО ТЕКСТУ
+# (_plan_rule_id), а не по позиции: редакции шаблона переставляют и убирают пункты.
+# rid 0–15 — пункты редакции 2025 (16 пунктов, в её порядке), 16–19 — правила
+# редакции 2026 (docs/ЧЕК-ЛИСТЫ.md, §4.1). Значение — словарь:
 #   file_keywords: список подстрок (lowercase) для поиска в имени файла; файл попадает в evidence если совпала любая.
 #   include_template: добавлять ли текст самого "ПЛАН аудита" в evidence (по умолчанию True для всех пунктов в правилах).
 #   extra_instructions: блок специфичных правил, дописывается в промпт verify_item_strict.
@@ -2553,7 +2330,115 @@ ITEM_RULES = {
             "В reason укажи найденные перерывы и их длительность в минутах."
         ),
     },
+    16: {
+        # Редакция 2026: «Заключительное совещание — И13 на каждом адресе».
+        "file_keywords": ["план"],
+        "extra_instructions": (
+            "Проверяется ТОЛЬКО заключительное совещание. В графике Плана дни идут с заголовками "
+            "«N-й день. ДД.ММ.ГГГГ (адрес)». Для КАЖДОГО адреса в последний день работы на этом "
+            "адресе должна быть строка «Заключительное совещание». Рабочие и промежуточные "
+            "совещания здесь не проверяются.\n"
+            "OK — заключительное совещание есть на каждом адресе. NOK — на каком-то адресе его нет; "
+            "назови адрес. В reason перечисли адреса и дни, где найдено заключительное совещание."
+        ),
+    },
+    17: {
+        # Редакция 2026: «Предварительное совещание — П15 на каждой площадке».
+        "file_keywords": ["план"],
+        "extra_instructions": (
+            "Проверяется ТОЛЬКО предварительное совещание. В графике Плана дни идут с заголовками "
+            "«N-й день. ДД.ММ.ГГГГ (адрес)». Для КАЖДОГО адреса (площадки) в первый день работы "
+            "на нём должна быть строка «Предварительное совещание».\n"
+            "OK — предварительное совещание есть на каждой площадке. NOK — на какой-то площадке "
+            "его нет; назови адрес. В reason перечисли адреса и дни, где оно найдено."
+        ),
+    },
+    18: {
+        # Редакция 2026: «П8 ≤ П4+5 р.д., но не ранее ПР3». По примеру шаблона
+        # (начало 10.02.2026 → утверждение не позднее 03.02.2026) это: утвердить не позже
+        # чем за 5 рабочих дней до начала и не раньше даты Приказа об ЭГ.
+        "file_keywords": ["план", "приказ", "эг", "назначен"],
+        "extra_instructions": (
+            "Этот пункт проверяет дату утверждения ПЛАНА аудита (блок «УТВЕРЖДАЮ» в шапке Плана).\n\n"
+            "ТРЕБОВАНИЕ: План утверждён НЕ ПОЗДНЕЕ чем за 5 рабочих дней до начала аудита и НЕ РАНЕЕ "
+            "даты Приказа о назначении экспертной группы.\n"
+            "Пример из шаблона: начало аудита 10.02.2026 → дата утверждения не позднее 03.02.2026.\n\n"
+            "АЛГОРИТМ:\n"
+            "1. D_утв — дата в блоке «УТВЕРЖДАЮ» Плана.\n"
+            "2. D_начало — первая дата из «Сроки проведения аудита».\n"
+            "3. D_приказа — дата Приказа о назначении ЭГ.\n"
+            "4. NOK, если между D_утв и D_начало меньше 5 рабочих дней (Пн–Пт), т.е. D_утв + 5 рабочих "
+            "дней > D_начало.\n"
+            "5. NOK, если D_утв раньше D_приказа.\n"
+            "6. Иначе OK. Утверждение задолго до начала аудита нарушением НЕ является.\n\n"
+            "В reason приведи все три даты и расчёт."
+        ),
+    },
+    19: {
+        # Редакция 2026: «Если П9 = серт/ресерт то = 1О11; если П9 = ИК то = Серт1».
+        "file_keywords": ["план", "сертификат", "игс", "отчет", "отчёт", "1 этап"],
+        "extra_instructions": (
+            "Этот пункт — про список ИСКЛЮЧЕНИЙ из СТО в Плане (раздел «Исключения из требований "
+            "стандартов»).\n"
+            "Список должен совпадать с источником, который зависит от вида аудита:\n"
+            "- инспекционный контроль (ИК) — с исключениями в Сертификате (приложение к сертификату);\n"
+            "- сертификация / ресертификация — с разделом «Исключения из требований стандартов» "
+            "Отчета по результатам первого этапа.\n"
+            "Сравни перечни пунктов СТО. OK — перечни совпадают. NOK — в Плане есть пункт, которого "
+            "нет в источнике, или наоборот; назови эти пункты.\n"
+            "Отдельный файл со стандартом «СТО Газпром 9001-2018» загружать НЕ нужно."
+        ),
+    },
 }
+
+
+def _plan_rule_id(item: dict) -> Optional[int]:
+    """Правило (ключ ITEM_RULES) для пункта шаблона «План АУДИТА» — по тексту пункта.
+
+    Пункты, переформулированные в редакции 2026, выбирают новое правило по формуле
+    шаблона: «…не ранее ПР3» — rid 18, исключения со ссылкой на 1О11/Серт1 — rid 19.
+    Неизвестный пункт → None: общая проверка моделью по тексту шаблона.
+    """
+    area = re.sub(r"\s+", " ", (item.get("area") or "").lower().replace("ё", "е")).strip()
+    formula = re.sub(r"\s+", "", (item.get("comments") or "").lower().replace("ё", "е"))
+
+    if "предварительн" in area and "заключительн" in area:
+        return 11  # совместный пункт редакции 2025
+    if "заключительное совещание" in area:
+        return 16
+    if "предварительное совещание" in area:
+        return 17
+    if "инструктаж" in area:
+        return 12
+    if "дата утверждения" in area:
+        return 18 if "пр3" in formula else 0
+    if "организационн" in area or "оргструктур" in area:
+        return 1
+    if "трудоемк" in area:
+        return 2
+    if "вид аудита" in area:
+        return 3
+    if "договор" in area:
+        return 5
+    if "сроки проведения" in area:
+        return 7
+    if "состав эг" in area or "состав экспертной группы" in area:
+        return 8
+    if "замечани" in area:
+        return 9
+    if "исключени" in area or "пунктов сто" in area:
+        return 19 if ("1о11" in formula or "серт" in formula) else 10
+    if "всех процессов" in area:
+        return 13
+    if "4.4.1" in area or area == "пункты":
+        return 14
+    if "перерыв" in area:
+        return 15
+    if "площадк" in area:
+        return 6
+    if area == "область" or area.startswith("область "):
+        return 4
+    return None
 
 
 # ===== Fuzzy-сверка подразделений (для п.2 «Орг.структура») =====
@@ -2816,9 +2701,12 @@ SVOD_ITEM_RULES = {
     },
     4: {  # №5 Коды ОКВЭД — наличие услуг
         "extra_instructions": (
-            "Внутренняя сверка Сводного акта: сравни раздел продукции (п.1) и раздел услуг/"
-            "работ (п.2). Проверь, что коды ОКВЭД услуг (п.2) соответствуют заявленной "
-            "области и не противоречат продукции (п.1). NOK — при явном расхождении."
+            "Внутренняя сверка Сводного акта: п.1 (область распространения СМК) и п.2 "
+            "(сведения о продукции/услугах). Если в области п.1 есть услуги — монтаж, "
+            "пусконаладка, проектирование, испытания, шефмонтаж и т.п., — то в п.2 должно "
+            "быть ДВЕ таблицы: «Сведения о продукции» и «Сведения об услугах». "
+            "OK — услуг в области нет, либо обе таблицы есть. NOK — услуги в области есть, "
+            "а таблицы услуг нет; назови найденные в области услуги."
         ),
     },
     5: {  # №6 Количество площадок (GigaChat — по решению пользователя, Заявка из OCR)
@@ -2908,7 +2796,44 @@ SVOD_ITEM_RULES = {
             "NOK — если подписи/даты отсутствуют ИЛИ просрочка более 20 рабочих дней."
         ),
     },
+    14: {  # №13 редакции 2026 — Аутсорсинг (СВ7=А50, обязательно заполнено)
+        "file_keywords": ["акт р", "акт 2", "акт по результ", "результатам аудита"],
+        "extra_instructions": (
+            "Проверь раздел Сводного акта «Организация передает на аутсорсинг следующие "
+            "процессы». Он ОБЯЗАТЕЛЬНО заполнен: перечень процессов либо явная запись, что "
+            "аутсорсинга нет. Перечень должен согласовываться с Актом по результатам аудита "
+            "(раздел «Способность процессов СМК…» / процессы СМК, переданные сторонним "
+            "организациям). NOK — раздел пуст или противоречит Акту; приведи обе формулировки."
+        ),
+    },
 }
+
+
+def _svod_rule_id(item: dict) -> Optional[int]:
+    """Правило (ключ SVOD_ITEM_RULES) для пункта «ЧК -Сводный акт» — по тексту пункта.
+    Ключи 0–13 — пункты №1–14 редакции 2025; в редакции 2026 пункты 6, 9 и 12 исключены,
+    а №13 стал «Аутсорсингом» (ключ 14). Неизвестный пункт → None (общая проверка)."""
+    area = re.sub(r"\s+", " ", (item.get("area") or "").lower().replace("ё", "е"))
+    for rid, keys in (
+        (0, ("соответствие формы",)),
+        (1, ("заполнение всех разделов",)),
+        (2, ("область распространения",)),
+        (4, ("наличие услуг",)),
+        (3, ("коды оквэд",)),
+        (5, ("количество площадок",)),
+        (6, ("адреса мест",)),
+        (7, ("численность",)),
+        (8, ("инфраструктур", "оборудовани")),
+        (9, ("режим работы",)),
+        (10, ("рекламаци",)),
+        (11, ("несоответстви",)),
+        (12, ("особого внимания",)),
+        (13, ("дата подписания", "подписей")),
+        (14, ("аутсорсинг",)),
+    ):
+        if any(k in area for k in keys):
+            return rid
+    return None
 
 
 _AUDIT_DAY_HOURS = 8.0
@@ -3090,6 +3015,99 @@ def extract_akt_smk_processes(akt_text: str) -> list:
     return out
 
 
+def _plan_approval_date(plan_raw: str):
+    """Дата утверждения Плана из блока «УТВЕРЖДАЮ»: «17» июля 2026 г. / « 01 » декабря 20 25 г."""
+    from datetime import date
+    m = re.search(r"«\s*(\d{1,2})\s*»\s*([А-Яа-яё]+)\s*20\s*(\d{2})\s*г", plan_raw or "")
+    mon = _ru_month(m.group(2)) if m else None
+    if not mon:
+        return None
+    try:
+        return date(2000 + int(m.group(3)), mon, int(m.group(1)))
+    except ValueError:
+        return None
+
+
+def _plan_start_date(plan_raw: str):
+    """Дата начала аудита из «Сроки проведения»: из диапазона 27-30.07.2026 — первая дата."""
+    from datetime import date
+    i = (plan_raw or "").find("Сроки проведения")
+    if i < 0:
+        return None
+    seg = plan_raw[i: i + 400]
+    md = (re.search(r"(\d{1,2})\s*[-–]\s*\d{1,2}\.(\d{1,2})\.(\d{2,4})", seg)
+          or re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", seg))
+    if not md:
+        return None
+    d, mo, y = int(md.group(1)), int(md.group(2)), int(md.group(3))
+    try:
+        return date(y + 2000 if y < 100 else y, mo, d)
+    except ValueError:
+        return None
+
+
+def _prikaz_date(text: str):
+    """Дата издания Приказа об ЭГ — первая дата в начале документа
+    («ПРИКАЗ № П/13-07/01 13 июля 2026 г.» или «13.07.2026»)."""
+    from datetime import date
+    head = (text or "")[:800]
+    m = re.search(r"(\d{1,2})\s+([А-Яа-яё]+)\s+(20\d{2})\s*г", head)
+    if m and _ru_month(m.group(2)):
+        try:
+            return date(int(m.group(3)), _ru_month(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    m = re.search(r"(?<!\d)(\d{1,2})\.(\d{1,2})\.(20\d{2})(?!\d)", head)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    return None
+
+
+_DAY_HEADER_RE = re.compile(r"(\d{1,2})\s*-?\s*й\s+день\.?\s*(\d{1,2}\.\d{1,2}\.\d{2,4})?", re.IGNORECASE)
+
+
+def _plan_schedule_days(plan_raw: str) -> list:
+    """Дни графика Плана: [{title, address, text}].
+
+    Заголовок дня — «1-й день. 27.07.2026», адрес — в скобках сразу за ним. День без
+    адреса относится к адресу предыдущего дня (одна площадка на несколько дней).
+    """
+    text = plan_raw or ""
+    headers = list(_DAY_HEADER_RE.finditer(text))
+    days, prev_addr = [], ""
+    for i, m in enumerate(headers):
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+        seg = text[m.end(): end]
+        stop = seg.find("\n===")  # служебные секции экстрактора (ОТМЕТКИ, колонтитулы)
+        if stop >= 0:
+            seg = seg[:stop]
+        am = re.match(r"\s*\(([^)]{3,200})\)", seg)
+        addr = re.sub(r"\s+", " ", am.group(1)).strip() if am else prev_addr
+        prev_addr = addr
+        days.append({"title": m.group(0).strip(), "address": addr, "text": seg})
+    return days
+
+
+def _plan_meeting_by_site(plan_raw: str, phrase: str, where: str) -> Optional[dict]:
+    """Есть ли совещание phrase на каждом адресе графика: where='first' — в первый
+    день работы на адресе, 'last' — в последний. None — график не распознан."""
+    days = _plan_schedule_days(plan_raw)
+    if not days:
+        return None
+    by_addr = {}
+    for d in days:
+        by_addr.setdefault(d["address"], []).append(d)
+    found, missing = [], []
+    for addr, addr_days in by_addr.items():
+        day = addr_days[0] if where == "first" else addr_days[-1]
+        label = f"{addr or 'площадка'}, {day['title']}"
+        (found if phrase in day["text"].lower().replace("ё", "е") else missing).append(label)
+    return {"found": found, "missing": missing, "sites": len(by_addr)}
+
+
 def _files_by_keyword(file_names: list, keywords: list) -> list:
     """Возвращает файлы, в имени которых встречается ЛЮБАЯ из подстрок (без учёта регистра)."""
     if not keywords:
@@ -3131,24 +3149,44 @@ def _files_by_content_keyword(file_names: list, all_texts: dict, keywords: list,
     return matched
 
 
+_AFTER_AUDIT_DOC_TYPES = {"pkd", "otchet_kd", "pn", "loo_org", "loo_exp", "zakl", "zakl1", "otchet_ustr1"}
+
+
 def process_checklist_advanced(api_key: str, all_texts: dict,
                                 checklist_structure: list,
                                 ii_references: dict,
                                 model: str = "GigaChat",
-                                template_text: str = "") -> dict:
+                                template_text: str = "",
+                                doc_type_map: Optional[dict] = None) -> dict:
     """
-    Per-item обработка чек-листа:
+    Per-item обработка чек-листа «План АУДИТА»:
       1. Извлечение шапки (1 вызов)
-      2. Для каждого пункта:
-         a. Классификация релевантных файлов (1 вызов)
+      2. Для каждого пункта (правило — по тексту пункта, см. _plan_rule_id):
+         a. Отбор файлов-источников
          b. Строгая проверка NOK-first (1 вызов)
          c. Adversarial-перепроверка если OK (1 вызов)
-    Всего: 1 + N*(2..3) вызовов GigaChat.
+         d. Детерминированные пост-проверки по тексту Плана
+    Всего: 1 + N*(1..2) вызовов GigaChat.
+    template_text — текст проверяемого Плана (поле 2), doc_type_map — {файл: тип
+    документа} (doc_types.classify_all), считается здесь, если не передан.
     """
     global processing_status
 
     total = len(checklist_structure)
     file_names = list(all_texts.keys())
+    if doc_type_map is None:
+        doc_type_map = doc_types.classify_all(all_texts)
+
+    # Детерминированные пост-проверки идут по чистому тексту Плана из поля 2
+    # (а не по evidence — там template_block обрезан до 30k и ОТМЕТКИ могут
+    # выпасть). Раньше План искали по слову «план» в имени файла: файл «Акт
+    # планового аудита» подходил тоже, а План с другим именем проверки пропускал.
+    plan_raw = template_text or ""
+    if not plan_raw:
+        for fn, txt in all_texts.items():
+            if doc_type_map.get(fn) == "plan" and txt:
+                plan_raw = txt
+                break
 
     processing_status.update({
         "stage": "header",
@@ -3169,6 +3207,13 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
             "РЭГ": "не найдено",
         }
 
+    # Документы, которые появляются ПОСЛЕ аудита (ПКД, Отчет КД, Протоколы НС, Листы
+    # оценки, Заключения, Отчет об устранении НС 1 этапа), источниками для Плана не
+    # бывают. Когда грузят весь пакет,
+    # «План КД» иначе попадал в evidence по слову «план» в имени.
+    plan_sources = {f: t for f, t in all_texts.items()
+                    if doc_type_map.get(f) not in _AFTER_AUDIT_DOC_TYPES}
+
     checklist_results = []
 
     for idx, item in enumerate(checklist_structure):
@@ -3180,8 +3225,9 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
         })
 
         try:
-            rule = ITEM_RULES.get(idx)
-            file_names = list(all_texts.keys())
+            rid = _plan_rule_id(item)
+            rule = ITEM_RULES.get(rid)
+            file_names = list(plan_sources.keys())
 
             keyword_hit = False
             if rule and rule.get("file_keywords"):
@@ -3194,7 +3240,7 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                     # _files_by_content_keyword): иначе файл с «неудачным» именем
                     # даёт авто-NOK, хотя нужные реквизиты в нём есть.
                     by_content = _files_by_content_keyword(
-                        file_names, all_texts, rule["file_keywords"]
+                        file_names, plan_sources, rule["file_keywords"]
                     )
                     if by_content:
                         relevant = by_content
@@ -3205,9 +3251,9 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         )
                     else:
                         # Фоллбэк: общий поиск по разделу/ключевым словам
-                        relevant = find_relevant_files_for_item(item, all_texts)
+                        relevant = find_relevant_files_for_item(item, plan_sources)
             else:
-                relevant = find_relevant_files_for_item(item, all_texts)
+                relevant = find_relevant_files_for_item(item, plan_sources)
 
             print(f"[item {idx+1}/{total}] релевантных файлов: {len(relevant)} (keyword_hit={keyword_hit})")
 
@@ -3261,113 +3307,94 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                                                comparison=comparison_flag,
                                                compare_fields=compare_fields)
 
-            # Детерминированные пост-проверки идут по чистому тексту Плана
-            # (а не по evidence — там template_block обрезан до 30k и ОТМЕТКИ могут
-            # выпасть).
-            plan_raw = ""
-            for fn, txt in all_texts.items():
-                if "план" in fn.lower() and txt:
-                    plan_raw = txt
-                    break
-
-            # Пункт 1 (idx=0): дата утверждения Плана vs дата начала аудита.
-            # Считаем сами — модель регулярно либо галлюцинирует даты, либо
-            # пишет «не позднее пяти рабочих дней» словами, и старый
-            # пост-чек на цифры в reason такие случаи пропускает.
-            if idx == 0 and plan_raw:
-                _MONTHS_RU = {
-                    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
-                    "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
-                }
-
-                def _month_num(word: str):
-                    w = (word or "").lower().replace("ё", "е")
-                    for stem, n in _MONTHS_RU.items():
-                        if w.startswith(stem):
-                            return n
-                    return None
-
-                d_utv = None
-                # «01» декабря 2025 г.  /  « 01 » декабря 20 25 г.
-                m = re.search(
-                    r"«\s*(\d{1,2})\s*»\s*([А-Яа-яё]+)\s*20\s*(\d{2})\s*г",
-                    plan_raw,
-                )
-                if m:
-                    mon = _month_num(m.group(2))
-                    if mon:
-                        d_utv = (int(m.group(1)), mon, 2000 + int(m.group(3)))
-
-                d_start = None
-                # «5 Сроки проведения аудита 09-11.12.2025г.» — диапазон.
-                # Сначала пытаемся распознать диапазон DD-DD.MM.YYYY (берём первую дату),
-                # затем — одиночную дату DD.MM.YYYY.
-                i_srok = plan_raw.find("Сроки проведения")
-                if i_srok >= 0:
-                    seg = plan_raw[i_srok : i_srok + 400]
-                    md = re.search(r"(\d{1,2})\s*[-–]\s*\d{1,2}\.(\d{1,2})\.(\d{2,4})", seg)
-                    if not md:
-                        md = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", seg)
-                    if md:
-                        d, mo, y = int(md.group(1)), int(md.group(2)), int(md.group(3))
-                        if y < 100:
-                            y += 2000
-                        d_start = (d, mo, y)
-
-                if d_utv and d_start:
-                    from datetime import date as _date, timedelta
-                    try:
-                        du = _date(d_utv[2], d_utv[1], d_utv[0])
-                        ds = _date(d_start[2], d_start[1], d_start[0])
-                    except ValueError:
-                        du = ds = None
-                    if du and ds:
-                        # Считаем рабочие дни от du до ds включительно (Пн–Пт).
-                        if du > ds:
-                            verdict["ok"] = False
-                            verdict["nok"] = True
+            # Дата утверждения Плана vs дата начала аудита. Считаем сами — модель
+            # регулярно либо галлюцинирует даты, либо пишет «не позднее пяти рабочих
+            # дней» словами, и старый пост-чек на цифры в reason такие случаи пропускает.
+            # rid=0 (редакция 2025): окно — от утверждения до начала не больше 5 рабочих дней.
+            if rid == 0 and plan_raw:
+                du, ds = _plan_approval_date(plan_raw), _plan_start_date(plan_raw)
+                if du and ds:
+                    from datetime import timedelta
+                    if du > ds:
+                        verdict["ok"] = False
+                        verdict["nok"] = True
+                        verdict["reason"] = (
+                            f"План утверждён ПОСЛЕ начала аудита: "
+                            f"D_утв={du.strftime('%d.%m.%Y')}, "
+                            f"D_начало={ds.strftime('%d.%m.%Y')}. Недопустимо."
+                        )
+                    else:
+                        # Рабочие дни от du до ds включительно (Пн–Пт).
+                        cnt = sum(
+                            1 for k in range((ds - du).days + 1)
+                            if (du + timedelta(days=k)).weekday() < 5
+                        )
+                        verdict["ok"] = cnt <= 5
+                        verdict["nok"] = not verdict["ok"]
+                        if verdict["ok"]:
                             verdict["reason"] = (
-                                f"План утверждён ПОСЛЕ начала аудита: "
+                                f"Дата утверждения Плана соответствует требованию: "
                                 f"D_утв={du.strftime('%d.%m.%Y')}, "
-                                f"D_начало={ds.strftime('%d.%m.%Y')}. Недопустимо."
+                                f"D_начало={ds.strftime('%d.%m.%Y')}, "
+                                f"между ними {cnt} рабочих дней (≤5)."
                             )
                         else:
-                            cnt = 0
-                            cur = du
-                            while cur <= ds:
-                                if cur.weekday() < 5:
-                                    cnt += 1
-                                cur += timedelta(days=1)
-                            if cnt > 5:
-                                verdict["ok"] = False
-                                verdict["nok"] = True
-                                verdict["reason"] = (
-                                    f"План утверждён слишком рано: "
-                                    f"D_утв={du.strftime('%d.%m.%Y')}, "
-                                    f"D_начало={ds.strftime('%d.%m.%Y')}, "
-                                    f"между ними {cnt} рабочих дней (требование ≤5)."
-                                )
-                            else:
-                                verdict["ok"] = True
-                                verdict["nok"] = False
-                                verdict["reason"] = (
-                                    f"Дата утверждения Плана соответствует требованию: "
-                                    f"D_утв={du.strftime('%d.%m.%Y')}, "
-                                    f"D_начало={ds.strftime('%d.%m.%Y')}, "
-                                    f"между ними {cnt} рабочих дней (≤5)."
-                                )
-                            print(
-                                f"[item 1 deterministic] D_утв={du.isoformat()} "
-                                f"D_начало={ds.isoformat()} рабочих_дней={cnt} -> "
-                                f"{'OK' if verdict['ok'] else 'NOK'}"
+                            verdict["reason"] = (
+                                f"План утверждён слишком рано: "
+                                f"D_утв={du.strftime('%d.%m.%Y')}, "
+                                f"D_начало={ds.strftime('%d.%m.%Y')}, "
+                                f"между ними {cnt} рабочих дней (требование ≤5)."
                             )
+                        print(
+                            f"[rid 0 deterministic] D_утв={du.isoformat()} "
+                            f"D_начало={ds.isoformat()} рабочих_дней={cnt} -> "
+                            f"{'OK' if verdict['ok'] else 'NOK'}"
+                        )
 
-            # Пункт 3 (idx=2, трудоёмкость): детерминированная сверка чисел.
+            # rid=18 (редакция 2026, «П8≤П4+5 р.д но не ранее ПР3»): утверждение не позже
+            # чем за 5 рабочих дней до начала аудита и не раньше даты Приказа об ЭГ.
+            # Раннее утверждение нарушением больше не считается.
+            if rid == 18 and plan_raw:
+                du, ds = _plan_approval_date(plan_raw), _plan_start_date(plan_raw)
+                dp = None
+                for fn in doc_types.files_of_type(doc_type_map, "prikaz"):
+                    dp = _prikaz_date(all_texts.get(fn, ""))
+                    if dp:
+                        break
+                if du and ds:
+                    latest = _add_workdays(ds, -5)
+                    fmt = lambda d: d.strftime('%d.%m.%Y')
+                    problems = []
+                    if du > latest:
+                        problems.append(
+                            f"утверждён позднее чем за 5 рабочих дней до начала аудита "
+                            f"(крайний срок {fmt(latest)})"
+                        )
+                    if dp and du < dp:
+                        problems.append(f"утверждён раньше Приказа об ЭГ от {fmt(dp)}")
+                    verdict["ok"] = not problems
+                    verdict["nok"] = bool(problems)
+                    dates = (
+                        f"D_утв={fmt(du)}, D_начало={fmt(ds)}, "
+                        f"D_приказа={fmt(dp) if dp else 'не найдена'}"
+                    )
+                    if problems:
+                        verdict["reason"] = f"План {'; '.join(problems)}: {dates}."
+                    else:
+                        verdict["reason"] = (
+                            f"Дата утверждения Плана соответствует требованию: {dates}. "
+                            f"Утверждён не позднее {fmt(latest)} (5 рабочих дней до начала)"
+                            + (" и не раньше Приказа об ЭГ." if dp else
+                               "; дата Приказа об ЭГ не найдена — нижняя граница не проверена.")
+                        )
+                    print(f"[rid 18 deterministic] {dates} -> {'OK' if verdict['ok'] else 'NOK'}")
+
+            # rid=2 (трудоёмкость): детерминированная сверка чисел.
             #   R_total = сумма «Вне территории» + «На территории» из строки Расчёта,
             #            соответствующей виду аудита из Плана.
             #   P_total = (число дней в графике Плана) × (число членов ЭГ в Плане).
             #   Расходятся → NOK с конкретными числами; совпадают → OK.
-            if idx == 2 and plan_raw:
+            if rid == 2 and plan_raw:
                 # P_days: парсим диапазон в «Сроки проведения».
                 p_days = None
                 i_sr = plan_raw.find("Сроки проведения")
@@ -3509,10 +3536,10 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                     )
                 # Если что-то из чисел не извлеклось — оставляем вердикт модели как есть.
 
-            # Пункт 2 (idx=1, орг.структура): детерминированная fuzzy-сверка.
+            # rid=1 (орг.структура): детерминированная fuzzy-сверка.
             # Перебивает вердикт модели, потому что OCR орг.структуры всегда
             # шумный и LLM регулярно ошибается в обе стороны.
-            if idx == 1:
+            if rid == 1:
                 org_files = [
                     f for f in relevant
                     if any(k in f.lower() for k in (
@@ -3540,10 +3567,10 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         f"missing={len(fz['missing'])} -> {'OK' if fz['ok'] else 'NOK'}"
                     )
 
-            # Пункт 4 (idx=3): вид аудита — в Плане обязана стоять галочка (☑/☒).
+            # rid=3: вид аудита — в Плане обязана стоять галочка (☑/☒).
             # Считаем напрямую в plan_raw. Если есть секция «ОТМЕТКИ» — берём её,
             # иначе сканируем весь текст Плана (на случай если docx-парсер не выделил секцию).
-            if idx == 3 and plan_raw:
+            if rid == 3 and plan_raw:
                 otmetki_idx = plan_raw.find("ОТМЕТКИ")
                 if otmetki_idx >= 0:
                     block = plan_raw[otmetki_idx:otmetki_idx + 10000]
@@ -3631,12 +3658,12 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                             f"В Плане отмечено: {', '.join(sorted(marked_in_plan)) or 'ничего'}."
                         )
 
-            # Пункт 6 (idx=5, договор): детерминированная сверка реквизитов.
+            # rid=5 (договор): детерминированная сверка реквизитов.
             # Из Плана извлекаем номер и дату договора (пункт 2 «Основание»),
             # затем ищем эти же реквизиты в любом из загруженных контрактных файлов.
             # Если совпадает — форс-OK; модель часто выдаёт самопротиворечивый NOK
             # с reason «...совпадает...совпадает».
-            if idx == 5 and plan_raw:
+            if rid == 5 and plan_raw:
                 m = re.search(
                     r"Договор[^№\n]*(?:№\s*)?([A-Za-zА-Яа-я0-9\-/_\.\s\(\)]{4,40}?)\s*от\s*(\d{1,2}[.\-/_ ]\d{1,2}[.\-/_ ]\d{2,4})",
                     plan_raw,
@@ -3687,11 +3714,11 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                             f"подтверждены в файле «{matched_file}»."
                         )
 
-            # Пункт 5 (idx=4, ОКВЭД/область сертификации):
+            # rid=4 (ОКВЭД/область сертификации):
             # Если из двух нужных файлов (Разбивка ОКВЭД и Сертификат ИГС) загружен
             # только один — переписать reason на понятный для аудитора, без
             # технического префикса «авто-NOK: режим сверки требует ...».
-            if idx == 4:
+            if rid == 4:
                 names_lc = [f.lower() for f in relevant]
                 has_razbivka = any(
                     ("разбивк" in n) or ("оквэд" in n) for n in names_lc
@@ -3718,33 +3745,60 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         "сверка формулировки области применения СМК невозможна."
                     )
 
-            # Пункт 11 (idx=10): исключения из СТО. Только п. 7.1.3.5 (1 абзац) и
-            # п. 7.1.4.3 (1 абзац) легитимны. Любой другой → NOK.
-            if idx == 10 and plan_raw:
-                # Находим раздел «8 Исключения из требований стандартов».
-                # Раньше брали 2000 символов — это захватывало соседний раздел графика
-                # с пунктами процессов (4.4.1, 4.3.2 и т.п.) и давало ложно-NOK.
-                # Сужаем: берём до следующего нумерованного раздела ("9 ", "10 ", ...) или 700 символов — что раньше.
-                excl_idx = plan_raw.find("Исключения из требований")
-                if excl_idx >= 0:
-                    raw_block = plan_raw[excl_idx:excl_idx + 2000]
-                    # Обрезаем на ближайшем следующем заголовке раздела вида "9 Заголовок" / "10 Заголовок"
-                    next_section = re.search(r'\n\s*(?:9|10|11|12)\s+[А-ЯA-Z]', raw_block)
-                    if next_section:
-                        block = raw_block[: next_section.start()]
+            # rid=19 (редакция 2026): исключения в Плане = исключения в источнике,
+            # который зависит от вида аудита: ИК — Сертификат (Серт1), сертификация /
+            # ресертификация — Отчет 1 этапа (1О11). Источника нет — правило rid=10 ниже.
+            exclusions_checked = False
+            if rid == 19 and plan_raw:
+                plan_block = _exclusion_block(plan_raw)
+                audit_type = ((header_data or {}).get("Вид аудита") or "").lower()
+                if "инспекцион" in audit_type:
+                    source_types = ("sertifikat",)
+                elif any(k in audit_type for k in ("ресертифик", "этап", "первичн")):
+                    source_types = ("otchet1",)
+                else:
+                    source_types = ("sertifikat", "otchet1")
+                src_file, src_block = None, None
+                for st in source_types:
+                    for fn in doc_types.files_of_type(doc_type_map, st):
+                        src_block = _exclusion_block(all_texts.get(fn, ""))
+                        if src_block:
+                            src_file = fn
+                            break
+                    if src_block:
+                        break
+                if plan_block is not None and src_block:
+                    plan_pts = set(_exclusion_clauses(plan_block))
+                    src_pts = set(_exclusion_clauses(src_block))
+                    only_plan, only_src = sorted(plan_pts - src_pts), sorted(src_pts - plan_pts)
+                    verdict["ok"] = not only_plan and not only_src
+                    verdict["nok"] = not verdict["ok"]
+                    if verdict["ok"]:
+                        verdict["reason"] = (
+                            f"Исключения в Плане ({', '.join(sorted(plan_pts)) or 'нет'}) "
+                            f"совпадают с «{src_file}»."
+                        )
                     else:
-                        block = raw_block[:700]
-                    # Учитываем только пункты, рядом с которыми есть контекст исключения
-                    # ('п.', 'пункт', 'абзац', 'не применяется', 'исключ').
-                    raw_pts_all = re.findall(r'\b(\d{1,2}(?:\.\d{1,2}){2,4})\b', block)
-                    raw_pts = []
-                    for p in raw_pts_all:
-                        pos = block.find(p)
-                        ctx = block[max(0, pos - 40): pos + 80].lower()
-                        if any(k in ctx for k in ("п.", "пункт", "абзац", "не применя", "исключ")):
-                            raw_pts.append(p)
-                    # Дедуп с сохранением порядка
-                    found_pts = list(dict.fromkeys(raw_pts))
+                        parts = []
+                        if only_plan:
+                            parts.append(f"только в Плане: {', '.join(only_plan)}")
+                        if only_src:
+                            parts.append(f"только в «{src_file}»: {', '.join(only_src)}")
+                        verdict["reason"] = f"Исключения в Плане расходятся с «{src_file}»: {'; '.join(parts)}."
+                    exclusions_checked = True
+                    print(f"[rid 19 exclusions] план={sorted(plan_pts)} источник={sorted(src_pts)} ({src_file})")
+
+            # rid=10: исключения из СТО. Только п. 7.1.3.5 (1 абзац) и
+            # п. 7.1.4.3 (1 абзац) легитимны. Любой другой → NOK.
+            if (rid == 10 or (rid == 19 and not exclusions_checked)) and plan_raw:
+                fallback_note = (
+                    "Источник для сверки исключений (Сертификат / Отчет 1 этапа) не найден — "
+                    "проверено по перечню допустимых исключений. "
+                    if rid == 19 else ""
+                )
+                block = _exclusion_block(plan_raw)
+                if block is not None:
+                    found_pts = _exclusion_clauses(block)
                     # Допустимы только 7.1.3.5 и 7.1.4.3, и только если рядом есть "абзац"
                     illegitimate: list[str] = []
                     for p in found_pts:
@@ -3757,11 +3811,11 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         ctx = block[max(0, p_pos - 30):p_pos + 80].lower()
                         if "абзац" not in ctx:
                             illegitimate.append(f"{p} (исключён целиком, без пометки про 1 абзац)")
-                    print(f"[item 11 exclusions] all={found_pts}, illegitimate={illegitimate}")
+                    print(f"[rid {rid} exclusions] all={found_pts}, illegitimate={illegitimate}")
                     if illegitimate:
                         verdict["ok"] = False
                         verdict["nok"] = True
-                        verdict["reason"] = (
+                        verdict["reason"] = fallback_note + (
                             f"[авто-NOK: нелегитимные исключения из СТО: {', '.join(illegitimate)}. "
                             f"Допустимы только п. 7.1.3.5 и п. 7.1.4.3, и только с пометкой «1 абзац».]"
                         )
@@ -3769,17 +3823,41 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         # Только допустимые исключения, но модель сказала NOK — переворачиваем
                         verdict["ok"] = True
                         verdict["nok"] = False
-                        verdict["reason"] = (
+                        verdict["reason"] = fallback_note + (
                             f"[авто-OK: исключения в Плане — {', '.join(found_pts)}, все легитимны "
                             f"(7.1.3.5/7.1.4.3 с пометкой «1 абзац»).]"
                         )
 
-            # Пункт 5 (idx=4): область сертификации. Редакции ТУ сверяем только
+            # rid=16 / rid=17 (редакция 2026): заключительное совещание — в последний
+            # день на каждом адресе графика, предварительное — в первый.
+            if rid in (16, 17) and plan_raw:
+                phrase, where, label = (
+                    ("заключительное совещан", "last", "Заключительное") if rid == 16
+                    else ("предварительное совещан", "first", "Предварительное")
+                )
+                meet = _plan_meeting_by_site(plan_raw, phrase, where)
+                if meet:
+                    verdict["ok"] = not meet["missing"]
+                    verdict["nok"] = bool(meet["missing"])
+                    day_word = "последний" if where == "last" else "первый"
+                    if verdict["ok"]:
+                        verdict["reason"] = (
+                            f"{label} совещание запланировано на каждом адресе "
+                            f"({meet['sites']}): {'; '.join(meet['found'])}."
+                        )
+                    else:
+                        verdict["reason"] = (
+                            f"{label} совещание не запланировано в {day_word} день на адресе: "
+                            f"{'; '.join(meet['missing'])}."
+                        )
+                    print(f"[rid {rid} meetings] адресов={meet['sites']} без совещания={len(meet['missing'])}")
+
+            # rid=4: область сертификации. Редакции ТУ сверяем только
             # между Планом и Сертификатом: «Разбивка по кодам ОКВЭД» законно
             # отстаёт от актуальной редакции (решение по методике), и её отставание
             # не должно давать NOK. Дословную сверку всей формулировки делать
             # нельзя — Сертификат приходит через OCR и слова искажены.
-            if idx == 4 and plan_raw:
+            if rid == 4 and plan_raw:
                 cert_files = [
                     f for f in relevant
                     if any(k in f.lower() for k in ("сертификат", "игс", "макет"))
@@ -3817,12 +3895,12 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         f"→ {'NOK' if diff else 'OK'}"
                     )
 
-            # Пункт 8 (idx=7): сроки аудита. Сверяем детерминированно — модель
+            # rid=7: сроки аудита. Сверяем детерминированно — модель
             # принимает дату ИЗДАНИЯ Приказа об ЭГ («ПРИКАЗ № П/03-07/01 03 июля
             # 2026 г.») за дату начала аудита и выдаёт ложное расхождение со
             # сроками Плана. Периодом считается только диапазон дат, одиночная
             # дата в шапке документа — нет (см. _find_audit_period).
-            if idx == 7 and plan_raw:
+            if rid == 7 and plan_raw:
                 plan_period = None
                 i_sr = plan_raw.find("Сроки проведения")
                 if i_sr >= 0:
@@ -3865,14 +3943,14 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         f"противоречит={len(conflicting)}"
                     )
 
-            # Пункт 14 (idx=13): процессы СМК из Акта предыдущего аудита должны
+            # rid=13: процессы СМК из Акта предыдущего аудита должны
             # присутствовать в Плане. Считаем детерминированно: процессы в Плане
             # «спрятаны» внутри плотных строк таблицы графика (вперемешку с ФИО,
             # адресами и пунктами стандарта), и модель их регулярно не вычленяет —
             # получался ложный NOK на корректном Плане. Формат записи процессов в
             # Плане отличается от шаблона к шаблону («Процесс П1» / «Процессы СМК:
             # Управление персоналом, ...»), поэтому ищем вхождение по всему тексту.
-            if idx == 13 and plan_raw:
+            if rid == 13 and plan_raw:
                 akt_procs, akt_src = [], ""
                 for f in relevant:
                     procs = extract_akt_smk_processes(all_texts.get(f, ""))
@@ -3903,16 +3981,16 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         f"нет в Плане={len(missing)} → {'NOK' if missing else 'OK'}"
                     )
 
-            # Пункт 15 (idx=14): для каждой строки с «Процесс» в Плане должны быть
+            # rid=14: для каждой строки с «Процесс» в Плане должны быть
             # пункты 4.4.1, 4.4.2, 4.4.3.
-            # Пункт 10 (idx=9, замечания/несоответствия предыдущего аудита):
+            # rid=9 (замечания/несоответствия предыдущего аудита):
             # детерминированная сверка АКТа и Плана.
             #   В Акте парсим п.24 «Количество значительных/малозначительных
             #   несоответствий» и общие фразы об отсутствии замечаний.
             #   В Плане ищем раздел «Замечания/несоответствия по результатам
             #   предыдущего аудита» (по тексту, не по номеру — в разных редакциях
             #   шаблона номер раздела может отличаться).
-            if idx == 9:
+            if rid == 9:
                 akt_files = [f for f in relevant if "акт" in f.lower()]
                 akt_text = "\n".join(all_texts.get(f, "") for f in akt_files)
 
@@ -4019,7 +4097,7 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                     f"-> {'OK' if verdict.get('ok') else 'NOK'}"
                 )
 
-            if idx == 14 and plan_raw:
+            if rid == 14 and plan_raw:
                 # Окно после «Процесс П<цифра>» — допускаем переносы строк,
                 # т.к. в извлечённом docx ячейки таблицы могут разделяться \n.
                 process_rows = re.findall(
@@ -4049,10 +4127,10 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                             f"отсутствует хотя бы один из 4.4.1/4.4.2/4.4.3.]"
                         )
 
-            # Пункт 12 (idx=11): совещания. Модель часто цепляется за маркеры ИИ13/ИИ9
+            # rid=11: совещания. Модель часто цепляется за маркеры ИИ13/ИИ9
             # из problems_hint и заявляет «отсутствует», даже когда в Плане совещания есть.
             # Считаем явные вхождения и переопределяем при достаточном покрытии.
-            if idx == 11 and not verdict.get("ok") and evidence:
+            if rid == 11 and not verdict.get("ok") and evidence:
                 ev_lc = evidence.lower()
                 preliminary = ev_lc.count("предварительное совещан")
                 final_meet = ev_lc.count("заключительное совещан")
@@ -4072,11 +4150,11 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         + (verdict.get("reason") or "")
                     )
 
-            # Пункт 13 (idx=12): инструктаж. Часто модель пишет «инструктаж не подтверждён»,
+            # rid=12: инструктаж. Часто модель пишет «инструктаж не подтверждён»,
             # хотя строка «Инструктаж по технике безопасности» физически присутствует в Плане.
             # Если в evidence слово «инструктаж» встречается, а модель сказала NOK по причине
             # «не подтверждено / не найдено / отсутствует» — переопределяем на OK.
-            if idx == 12 and not verdict.get("ok") and evidence:
+            if rid == 12 and not verdict.get("ok") and evidence:
                 inst_count = evidence.lower().count("инструктаж")
                 reason_lc = (verdict.get("reason") or "").lower()
                 deny_signals = ("не подтвержд", "не найден", "отсутств", "пропущен", "не обнаруж", "маркер")
@@ -4178,10 +4256,14 @@ def _svod_locate_text(all_texts: dict, name_kws, content_kws):
     return None
 
 
-def _svod_deterministic_postcheck(idx: int, verdict: dict, svod_doc_text: str, all_texts: dict) -> dict:
+def _svod_deterministic_postcheck(idx: Optional[int], verdict: dict, svod_doc_text: str,
+                                  all_texts: dict, item: Optional[dict] = None) -> dict:
     """Детерминированные пост-проверки поверх вердикта модели. Меняют вердикт ТОЛЬКО
     когда удаётся уверенно извлечь нужные значения; иначе оставляют ответ GigaChat.
-    Покрывают структурные пункты Сводного акта: №3, 7, 8, 10, 11, 14."""
+    idx — ключ SVOD_ITEM_RULES (_svod_rule_id), item — пункт шаблона: по его формуле
+    выбирается источник там, где редакция 2026 его сменила.
+    Покрывают структурные пункты Сводного акта: №3, 7, 8, 10, 11, 13 (аутсорсинг), 14."""
+    formula = re.sub(r"\s+", "", ((item or {}).get("comments") or "").lower())
     # Гарантируем доступ к тексту Сводного акта (фолбэк — поиск в источниках по содержимому)
     svod = svod_doc_text or ""
     if "общие сведения об организации" not in svod.lower():
@@ -4191,23 +4273,34 @@ def _svod_deterministic_postcheck(idx: int, verdict: dict, svod_doc_text: str, a
                 break
     svod_low = svod.lower()
 
-    # №3 (idx 2) — область распространения СМК = п.1 Акта Р (сверка формулировок)
+    # №3 (idx 2) — область распространения СМК = п.27 Акта Р «Дополнительные сведения»
+    # (А43 — если область изменялась) или п.1 Акта Р (А30). Сверка формулировок по словам.
     if idx == 2:
         i = svod_low.find("область распространения смк")
         akt = _svod_locate_text(all_texts, ("акт р", "акт 2", "результатам аудита", "акт по результ"),
                                 ("цель и область аудита", "область применения"))
-        j = (akt or "").lower().find("применительно к")
-        if i >= 0 and akt and j >= 0:
+        akt_low = (akt or "").lower()
+        candidates = []
+        j = akt_low.find("применительно к")
+        if j >= 0:
+            candidates.append(("п.1 Акта Р", akt[j:j + 500]))
+        k = akt_low.find("дополнительные сведения")
+        if k >= 0 and "област" in akt_low[k:k + 300]:
+            candidates.append(("п.27 Акта Р (изменение области)", akt[k:k + 600]))
+        if i >= 0 and candidates:
             sv = _svod_norm_words(svod[i:i + 500])
-            ak = _svod_norm_words(akt[j:j + 500])
-            jac = len(sv & ak) / max(1, len(sv | ak))
+            scored = []
+            for label, text in candidates:
+                ak = _svod_norm_words(text)
+                scored.append((len(sv & ak) / max(1, len(sv | ak)), label))
+            jac, label = max(scored)
             if jac >= 0.7:
                 verdict["ok"], verdict["nok"] = True, False
                 verdict["reason"] = (f"[детерм.] Формулировка области распространения СМК совпадает "
-                                     f"с п.1 Акта Р (совпадение слов {int(jac*100)}%). OK.")
+                                     f"с {label} (совпадение слов {int(jac*100)}%). OK.")
             elif jac < 0.5:
                 verdict["ok"], verdict["nok"] = False, True
-                verdict["reason"] = (f"[детерм.] Формулировка области в Сводном акте и п.1 Акта Р "
+                verdict["reason"] = (f"[детерм.] Формулировка области в Сводном акте и {label} "
                                      f"расходится (совпадение слов {int(jac*100)}%). NOK.")
         return verdict
 
@@ -4233,20 +4326,42 @@ def _svod_deterministic_postcheck(idx: int, verdict: dict, svod_doc_text: str, a
                 )
         return verdict
 
-    # №8 (idx 7) — численность персонала в системе менеджмента
+    # №8 (idx 7) — численность персонала в системе менеджмента. Редакция 2026
+    # («СВ4= ТР1») сверяет с Расчётом трудоёмкости, редакция 2025 — с Отчётом 1 этапа.
     if idx == 7:
         ms = re.search(r"численность персонала в системе менеджмента\D{0,12}(\d+)", svod_low)
-        otch = _svod_locate_text(all_texts, ("отчет", "отчёт", "1 этап", "первого этап"),
-                                 ("первого этапа", "распространяется смк"))
-        mo = re.search(r"распространяется смк[:\s]*?(\d+)", (otch or "").lower()) if otch else None
+        if "тр1" in formula:
+            src_label = "Расчёт трудоёмкости"
+            src = _svod_locate_text(all_texts, ("трудоемкост", "трудоёмкост", "расчет труд", "расчёт труд"),
+                                    ("расчет трудоемкости",))
+            mo = re.search(r"численность персонала[^|\n]{0,80}\|\s*(\d+)",
+                           (src or "").lower().replace("ё", "е")) if src else None
+        else:
+            src_label = "Отчёт 1 этапа"
+            src = _svod_locate_text(all_texts, ("отчет", "отчёт", "1 этап", "первого этап"),
+                                    ("первого этапа", "распространяется смк"))
+            mo = re.search(r"распространяется смк[:\s]*?(\d+)", (src or "").lower()) if src else None
         if ms and mo:
             a, b = int(ms.group(1)), int(mo.group(1))
             ok = a == b
             verdict["ok"], verdict["nok"] = ok, not ok
             verdict["reason"] = (
-                f"[детерм.] Численность персонала в СМК: Сводный акт — {a}, Отчёт 1 этапа — {b}. "
+                f"[детерм.] Численность персонала в СМК: Сводный акт — {a}, {src_label} — {b}. "
                 + ("Совпадает — OK." if ok else "Расхождение — NOK.")
             )
+        return verdict
+
+    # №13 (idx 14, редакция 2026) — раздел «Организация передает на аутсорсинг …»
+    # обязан быть заполнен. Пустой раздел — NOK; сверку перечня с Актом (А50) делает модель.
+    if idx == 14:
+        m = re.search(r"переда[её]т на аутсорсинг[^:\n]*:(.*?)(?:\n\s*\d{1,2}\.\s|\Z)",
+                      svod, re.IGNORECASE | re.DOTALL)
+        if m:
+            value = m.group(1).strip(" |\n\t")
+            if len(value) < 3:
+                verdict["ok"], verdict["nok"] = False, True
+                verdict["reason"] = ("[детерм.] Раздел «Организация передает на аутсорсинг следующие "
+                                     "процессы» в Сводном акте не заполнен. NOK.")
         return verdict
 
     # №10 (idx 9) — режим работы: число смен в Сводном акте vs Расчёт трудоёмкости
@@ -4317,7 +4432,7 @@ def process_checklist_svod(api_key: str, all_texts: dict,
                             model: str = "GigaChat",
                             svod_doc_text: str = "") -> dict:
     """
-    Per-item обработка чек-листа «Сводный акт» (14 пунктов).
+    Per-item обработка чек-листа «Сводный акт». Правило пункта — по его тексту (_svod_rule_id).
     Без шапки Заявителя. Главный проверяемый документ — Сводный акт (svod_doc_text) —
     подставляется в evidence каждого пункта. Источники для сверки берутся из all_texts
     по SVOD_ITEM_RULES[idx]['file_keywords']. Пункты с manual=True не гоняются через
@@ -4338,7 +4453,8 @@ def process_checklist_svod(api_key: str, all_texts: dict,
             "detail": "",
         })
 
-        rule = SVOD_ITEM_RULES.get(idx, {})
+        rid = _svod_rule_id(item)
+        rule = SVOD_ITEM_RULES.get(rid, {})
         is_manual = bool(rule.get("manual"))
 
         try:
@@ -4397,7 +4513,7 @@ def process_checklist_svod(api_key: str, all_texts: dict,
 
             # Детерминированные пост-чеки (числа/даты) поверх вердикта модели
             if not is_manual:
-                verdict = _svod_deterministic_postcheck(idx, verdict, svod_doc_text, all_texts)
+                verdict = _svod_deterministic_postcheck(rid, verdict, svod_doc_text, all_texts, item)
 
             # Ручные пункты: GigaChat извлёк данные, но авто-вердикт не ставим —
             # помечаем «ПРОВЕРИТЬ ВРУЧНУЮ» и оставляем обе клетки ОК/NOK пустыми.
@@ -4542,6 +4658,64 @@ async def root():
     return {"message": "Audit Plan Filler API", "version": "1.0.0"}
 
 
+def _validate_plan_output(file_path: Path) -> dict:
+    """Проверка заполненного Плана АУДИТА: шапка заполнена, в каждой строке ровно одна
+    отметка ОК/NOK."""
+    doc = Document(str(file_path))
+    header_filled = []
+
+    for table in doc.tables:
+        cols = len(table.rows[0].cells)
+
+        if cols == 2:  # Шапка
+            for row in table.rows:
+                text = " ".join(cell.text.strip() for cell in row.cells)
+                right = row.cells[1].text.strip() if len(row.cells) > 1 else ""
+                if any(k in text for k in ["Заявител", "Вид аудита", "Даты", "РЭГ"]):
+                    header_filled.append(bool(right and len(right) > 2))
+
+    # Отметки ОК/NOK — по колонкам, найденным по заголовкам таблицы чек-листа
+    checklist_rows = []
+    for row in checklists.read_marks(doc, ok_marks=("☑",), nok_marks=("☒",)):
+        checklist_rows.append({
+            "area": row["area"][:60],
+            "ok": row["ok"],
+            "nok": row["nok"],
+            "both": row["ok"] and row["nok"],
+            "none": not row["ok"] and not row["nok"],
+        })
+
+    issues = []
+    for i, row in enumerate(checklist_rows):
+        if row["both"]:
+            issues.append(f"Строка {i+1}: ОБА маркера OK и NOK")
+        elif row["none"]:
+            issues.append(f"Строка {i+1}: НЕТ маркера")
+
+    # Структурные проблемы заполнения
+    if len(checklist_rows) == 0:
+        issues.append("Чек-лист не распознан: ни одной строки не найдено (проверь шаблон)")
+    if header_filled and not all(header_filled):
+        missing = len(header_filled) - sum(header_filled)
+        issues.append(f"Шапка заполнена не полностью: {missing} из {len(header_filled)} полей пусты")
+
+    ok_count = sum(1 for r in checklist_rows if r["ok"])
+    nok_count = sum(1 for r in checklist_rows if r["nok"])
+
+    # NOK в чек-листе — это содержательная проблема, тоже отражаем как issue.
+    if nok_count > 0:
+        issues.append(f"Обнаружены замечания (NOK): {nok_count} из {len(checklist_rows)} пунктов")
+
+    return {
+        "valid": len(issues) == 0,
+        "header_filled": f"{sum(header_filled)}/{len(header_filled)} полей",
+        "checklist_total": len(checklist_rows),
+        "ok_count": ok_count,
+        "nok_count": nok_count,
+        "issues": issues
+    }
+
+
 @app.get("/api/validate/{filename:path}")
 async def validate_result(filename: str):
     """Проверка корректности заполненного документа.
@@ -4553,72 +4727,8 @@ async def validate_result(filename: str):
         raise HTTPException(status_code=400, detail="Некорректный путь")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Файл не найден")
-    
-    # Загружаем последнюю структуру чек-листа из сохранённых данных
-    # Для этого прочитаем сохранённый результат если есть
-    # Или просто вердим базовую валидацию
     try:
-        doc = Document(str(file_path))
-        checklist_rows = []
-        header_filled = []
-        
-        for table in doc.tables:
-            cols = len(table.rows[0].cells)
-            
-            if cols == 2:  # Шапка
-                for row in table.rows:
-                    text = " ".join(cell.text.strip() for cell in row.cells)
-                    right = row.cells[1].text.strip() if len(row.cells) > 1 else ""
-                    if any(k in text for k in ["Заявител", "Вид аудита", "Даты", "РЭГ"]):
-                        header_filled.append(bool(right and len(right) > 2))
-            
-            if cols >= 5:
-                first_cell = table.rows[0].cells[0].text.strip()
-                if "Область проверки" in first_cell:
-                    for row in table.rows[1:]:
-                        area = row.cells[0].text.strip()
-                        ok = row.cells[2].text.strip()
-                        nok = row.cells[3].text.strip()
-                        if area:
-                            has_ok = "☑" in ok
-                            has_nok = "☒" in nok
-                            checklist_rows.append({
-                                "area": area[:60],
-                                "ok": has_ok,
-                                "nok": has_nok,
-                                "both": has_ok and has_nok,
-                                "none": not has_ok and not has_nok
-                            })
-        
-        issues = []
-        for i, row in enumerate(checklist_rows):
-            if row["both"]:
-                issues.append(f"Строка {i+1}: ОБА маркера OK и NOK")
-            elif row["none"]:
-                issues.append(f"Строка {i+1}: НЕТ маркера")
-
-        # Структурные проблемы заполнения
-        if len(checklist_rows) == 0:
-            issues.append("Чек-лист не распознан: ни одной строки не найдено (проверь шаблон)")
-        if header_filled and not all(header_filled):
-            missing = len(header_filled) - sum(header_filled)
-            issues.append(f"Шапка заполнена не полностью: {missing} из {len(header_filled)} полей пусты")
-
-        ok_count = sum(1 for r in checklist_rows if r["ok"])
-        nok_count = sum(1 for r in checklist_rows if r["nok"])
-
-        # NOK в чек-листе — это содержательная проблема, тоже отражаем как issue.
-        if nok_count > 0:
-            issues.append(f"Обнаружены замечания (NOK): {nok_count} из {len(checklist_rows)} пунктов")
-
-        return {
-            "valid": len(issues) == 0,
-            "header_filled": f"{sum(header_filled)}/{len(header_filled)} полей",
-            "checklist_total": len(checklist_rows),
-            "ok_count": ok_count,
-            "nok_count": nok_count,
-            "issues": issues
-        }
+        return _validate_plan_output(file_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка валидации: {str(e)}")
 
@@ -4691,455 +4801,359 @@ async def upload_files(
             block_files.append(file.filename)
 
     if block:
-        blocks = dict(meta.get("blocks") or {})
+        blocks = {k: [n for n in v if n not in block_files] for k, v in (meta.get("blocks") or {}).items()}
         blocks[block] = block_files
         _save_session_meta(sid, blocks=blocks)
 
     return {"status": "ok", "session_id": sid, "uploaded_files": uploaded, "count": len(uploaded)}
 
 
-@app.post("/api/process")
-async def process_documents(
-    api_key: str = Form(...),
-    template_file: str = Form(...),
-    session_id: str = Form(...),
-    plan_doc_file: Optional[str] = Form(None),
-    plan_doc_file_2: Optional[str] = Form(None),
-    template_file_2: Optional[str] = Form(None),
-):
-    """
-    Обработка документов через GigaChat и заполнение чек-листа(ов).
-    В поле 1 может быть один или два чек-листа: «План АУДИТА» и/или «Сводный акт».
-    Тип каждого определяется автоматически; обрабатываются по очереди (План → Сводный),
-    на выходе — отдельный заполненный файл на каждый чек-лист.
-    """
+# ============================================================================
+# Пакет аудита (этап 4): разбор трёх полей, фоновая проверка, статус по сессии.
+# Поле 1 — бланки чек-листов, поле 2 — проверяемые документы, поле 3 — источники
+# (meta.blocks: checklist / plan / sources). docs/ЧЕК-ЛИСТЫ.md §7.
+# ============================================================================
+
+def _extract_text(path: Path) -> Optional[str]:
+    """Текст файла (docx/docm/pdf/xlsx) или None — формат не поддерживается или ошибка чтения."""
+    suffix = path.suffix.lower()
+    try:
+        if suffix in ('.docx', '.docm'):
+            return extract_text_from_docx(str(path))
+        if suffix == '.pdf':
+            return extract_text_from_pdf(str(path))
+        if suffix == '.xlsx':
+            return extract_text_from_xlsx(str(path))
+    except Exception as e:
+        print(f"ERR Ошибка чтения {path.name}: {e}")
+    return None
+
+
+_EXTRACT_WORKERS = 3
+
+
+def _session_texts(session_id: str, sdir: Path, names: list, status: dict) -> dict:
+    """Тексты файлов сессии с кэшем на диске (_texts.json): повторный разбор пакета и запуск
+    проверки не читают файлы заново — OCR сканов идёт минутами. Кэш сбрасывается для файла,
+    у которого поменялись размер или время изменения."""
+    with _session_lock(session_id):
+        cache_path = sdir / "_texts.json"
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+        texts, todo = {}, []
+        for name in names:
+            try:
+                st = (sdir / name).stat()
+            except OSError:
+                continue
+            stamp = f"{st.st_size}:{int(st.st_mtime)}"
+            hit = cache.get(name)
+            if hit and hit.get("stamp") == stamp:
+                texts[name] = hit.get("text")
+            else:
+                todo.append((name, stamp))
+
+        if todo:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            status.update({"stage": "extract", "current": 0, "total": len(todo),
+                           "message": f"Чтение файлов: 0 из {len(todo)}", "detail": ""})
+            done = 0
+            with ThreadPoolExecutor(max_workers=_EXTRACT_WORKERS) as ex:
+                futures = {ex.submit(_extract_text, sdir / name): (name, stamp) for name, stamp in todo}
+                for fut in as_completed(futures):
+                    name, stamp = futures[fut]
+                    text = fut.result()
+                    texts[name] = text
+                    cache[name] = {"stamp": stamp, "text": text}
+                    done += 1
+                    status.update({"current": done, "message": f"Чтение файлов: {done} из {len(todo)}",
+                                   "detail": name})
+        for stale in set(cache) - set(names):
+            cache.pop(stale, None)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        return texts
+
+
+def _session_package_files(session_id: str, sdir: Path) -> list:
+    """Файлы сессии с полем загрузки (meta.blocks). Файл без поля считается источником."""
+    blocks = _load_session_meta(session_id).get("blocks") or {}
+    field_of = {name: field for field in package.FIELDS for name in blocks.get(field, [])}
+    return [{"name": f["name"], "field": field_of.get(f["name"], "sources"), "path": sdir / f["name"]}
+            for f in _list_session_files(sdir)]
+
+
+def _analyze_session(session_id: str, sdir: Path, overrides: dict, choices: dict, status: dict):
+    """(разбор пакета, файлы с текстами)."""
+    files = _session_package_files(session_id, sdir)
+    texts = _session_texts(session_id, sdir, [f["name"] for f in files], status)
+    for f in files:
+        f["text"] = texts.get(f["name"])
+    return package.analyze_package(files, overrides, choices), files
+
+
+def _normalize_counts(extracted: dict, structure: list):
+    """Приводим число результатов к числу пунктов чек-листа (обрезка/дополнение)."""
+    if "checklist" not in extracted:
+        return
+    actual = extracted["checklist"]
+    n = len(structure)
+    if len(actual) > n:
+        print(f"GigaChat вернул {len(actual)} пунктов, в документе {n}. Обрезано.")
+        extracted["checklist"] = actual[:n]
+    elif len(actual) < n:
+        for i in range(len(actual), n):
+            area_name = structure[i]['area'][:60] if i < len(structure) else f"пункт {i+1}"
+            extracted["checklist"].append({
+                "ok": False, "nok": True,
+                "reason": f"Нет данных для проверки: {area_name}",
+                "problems": f"Нет данных для проверки: {area_name}",
+                "ii_data_found": "",
+            })
+    for item in extracted["checklist"]:
+        item.setdefault("reason", item.get("problems", ""))
+        item.setdefault("ii_data_found", "")
+
+
+def _counts_validation(results: list, notes: Optional[list] = None) -> dict:
+    return {
+        "valid": True,
+        "issues": [],
+        "notes": notes or [],
+        "ok_count": sum(1 for it in results if it.get("ok")),
+        "nok_count": sum(1 for it in results if it.get("nok")),
+        "manual_count": sum(1 for it in results if not it.get("ok") and not it.get("nok")),
+        "total": len(results),
+    }
+
+
+def _output_name(ck: dict, used: set) -> str:
+    """Имя файла результата; План и Сводный — прежние имена (на них ссылается админка)."""
+    base = {"plan": "Заполненный_План_АУДИТА", "svod": "Заполненный_Сводный_акт"}.get(
+        ck["type"], f"Заполненный_ЧК_{ck['title'].replace(' ', '_')}")
+    name, n = f"{base}.docx", 2
+    while name in used:
+        name, n = f"{base}_{n}.docx", n + 1
+    used.add(name)
+    return name
+
+
+def _run_one_checklist(ck: dict, sdir: Path, out_path: Path, api_key: str, model: str,
+                       texts: dict, all_texts: dict, doc_type_map: dict) -> tuple:
+    """Проверка одного чек-листа и заполнение бланка. Возвращает (данные, проверка результата)."""
+    cpath = sdir / ck["file"]
+    ctype = ck["type"]
+    structure = checklists.parse_checklist(str(cpath))
+    checked_text = texts.get(ck["selected"][0]) or ""
+
+    if ctype == "plan":
+        if len(checked_text.strip()) < 100:
+            raise ValueError(f"Не удалось извлечь текст Плана аудита «{ck['selected'][0]}» "
+                             f"(прочитано символов: {len(checked_text.strip())}).")
+        data = process_checklist_advanced(api_key, all_texts, structure, extract_ii_references(str(cpath)),
+                                          model, checked_text, doc_type_map)
+        if "error" in data:
+            raise ValueError(data["error"])
+        _normalize_counts(data, structure)
+        processing_status.update({"stage": "fill", "message": "Заполнение Плана АУДИТА…", "detail": ""})
+        fill_plan_with_checklist(str(cpath), data, str(out_path), structure)
+        processing_status.update({"stage": "validate", "message": "Проверка заполненного Плана…"})
+        validation = _validate_plan_output(out_path)
+        try:
+            applicant_check = cross_check_applicant_name(api_key, checked_text, all_texts, model)
+        except Exception as e:
+            print(f"WARN: cross-check заявителя не выполнен: {e}")
+            applicant_check = None
+        if applicant_check and applicant_check.get("match") is False:
+            note = (f"Наименование заявителя в Плане и в источниках различается. "
+                    f"План: «{applicant_check.get('plan_name') or '—'}». "
+                    f"Источники: «{applicant_check.get('sources_name') or '—'}».")
+            if applicant_check.get("note"):
+                note += f" {applicant_check['note']}"
+            validation["notes"] = list(validation.get("notes") or []) + [note]
+            validation["applicant_check"] = applicant_check
+        return data, validation
+
+    if ctype == "svod":
+        if len(checked_text.strip()) < 100:
+            raise ValueError(f"Не удалось извлечь текст Сводного акта «{ck['selected'][0]}».")
+        data = process_checklist_svod(api_key, all_texts, structure, model, checked_text)
+        _normalize_counts(data, structure)
+        processing_status.update({"stage": "fill", "message": "Заполнение Сводного акта…", "detail": ""})
+        fill_svod_with_checklist(str(cpath), data, str(out_path), structure)
+        return data, _counts_validation(data.get("checklist", []))
+
+    processing_status.update({"stage": "verify", "current": 0, "total": len(structure),
+                              "message": f"Проверка: {ck['title']}", "detail": ""})
+    data = formula_checks.run_checklist(ctype, structure, {n: texts.get(n) or "" for n in ck["selected"]},
+                                        all_texts, doc_type_map)
+    processing_status.update({"stage": "fill", "message": f"Заполнение: {ck['title']}", "detail": ""})
+    fill_formula_checklist(str(cpath), data, str(out_path), structure)
+    notes = [v for k, v in formula_checks.ASSUMPTIONS.items() if ctype.startswith(k)]
+    return data, _counts_validation(data.get("checklist", []), notes)
+
+
+def _run_package_job(session_id: str, sdir: Path, api_key: str, selection: list,
+                     overrides: dict, choices: dict):
+    """Фоновая проверка выбранных чек-листов. Результат каждого чек-листа появляется в
+    статусе сразу после него; ошибка одного чек-листа не останавливает остальные."""
+    status = _job_status(session_id)
+    _status_local.status = status
+    model, scope = _get_active_model(), _get_active_scope()
+    try:
+        analysis, files = _analyze_session(session_id, sdir, overrides, choices, status)
+        by_file = {c["file"]: c for c in analysis["checklists"]}
+        todo = [by_file[n] for n in selection if n in by_file and by_file[n]["ready"]]
+        todo.sort(key=lambda c: {"plan": 0, "svod": 1}.get(c["type"], 2))
+        texts = {f["name"]: f["text"] for f in files}
+        docs = [f for f in analysis["files"] if f["kind"] == "document"]
+        all_texts = {d["name"]: texts[d["name"]] for d in docs if texts.get(d["name"]) is not None}
+        doc_type_map = {d["name"]: d["doc_type"] for d in docs}
+
+        gigachat_error = None
+        if any(c["needs_gigachat"] for c in todo):
+            status.update({"stage": "preflight", "message": f"Проверка соединения с GigaChat ({model})…",
+                           "detail": ""})
+            pf = gigachat_preflight(api_key, 8.0, model, scope)
+            if not pf["ok"]:
+                gigachat_error = f"GigaChat недоступен ({pf['stage']}): {pf['detail']}"
+
+        out_dir = OUTPUT_DIR / session_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        used_names = set()
+        for i, ck in enumerate(todo, 1):
+            status.update({"checklist": ck["title"], "stage": "verify", "current": 0,
+                           "total": ck["items"] or 0, "message": f"{ck['title']} ({i} из {len(todo)})",
+                           "detail": ""})
+            out = {"type": ck["type"], "title": ck["title"], "checklist_file": ck["file"],
+                   "checked_files": ck["selected"], "warnings": ck["warnings"]}
+            try:
+                if ck["needs_gigachat"] and gigachat_error:
+                    raise RuntimeError(gigachat_error)
+                out_name = _output_name(ck, used_names)
+                data, validation = _run_one_checklist(ck, sdir, out_dir / out_name, api_key, model,
+                                                      texts, all_texts, doc_type_map)
+                results = data.get("checklist", [])
+                out.update({
+                    "output_file": f"{session_id}/{out_name}",
+                    "ok_count": sum(1 for it in results if it.get("ok")),
+                    "nok_count": sum(1 for it in results if it.get("nok")),
+                    "manual_count": sum(1 for it in results if not it.get("ok") and not it.get("nok")),
+                    "total_items": len(results),
+                    "header": data.get("header") or None,
+                    "checklist": results,
+                    "validation": validation,
+                })
+            except Exception as e:
+                print(f"[{ck['title']}] ошибка: {e}")
+                out["error"] = str(e)[:500]
+            status["outputs"] = status["outputs"] + [out]
+
+        done = [o for o in status["outputs"] if not o.get("error")]
+        applicant = next((d["org"] for d in docs if d["org"] and any(d["name"] in c["selected"] for c in todo)), None)
+        _save_session_meta(
+            session_id,
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            model=model if any(c["needs_gigachat"] for c in todo) else None,
+            outputs=status["outputs"],
+            document_types=doc_type_map,
+            applicant=applicant,
+            output_file=done[0]["output_file"] if done else None,
+            ok_count=sum(o["ok_count"] for o in done),
+            nok_count=sum(o["nok_count"] for o in done),
+            total_items=sum(o["total_items"] for o in done),
+            header=next((o["header"] for o in done if o.get("header")), None),
+            checklist=done[0]["checklist"] if done else None,
+        )
+        failed = len(status["outputs"]) - len(done)
+        status.update({"stage": "done", "running": False, "checklist": None, "detail": "",
+                       "finished_at": datetime.now().isoformat(timespec="seconds"),
+                       "message": f"Готово: проверено чек-листов {len(done)}"
+                                  + (f", с ошибкой {failed}" if failed else "")})
+    except Exception as e:
+        print(f"[job {session_id}] ошибка: {e}")
+        status.update({"stage": "error", "running": False, "error": str(e)[:500],
+                       "message": f"Ошибка: {str(e)[:200]}",
+                       "finished_at": datetime.now().isoformat(timespec="seconds")})
+    finally:
+        _status_local.status = None
+
+
+def _existing_session(session_id: str) -> Path:
     if not _SESSION_ID_RE.match(session_id or ""):
         raise HTTPException(status_code=400, detail="Некорректный session_id")
     sdir = UPLOAD_DIR / session_id
     if not sdir.is_dir():
-        raise HTTPException(status_code=400, detail="Сессия не найдена")
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    return sdir
 
-    # Проверяем наличие загруженных файлов в папке сессии
-    docx_files = list(sdir.glob("*.docx"))
-    docm_files = list(sdir.glob("*.docm"))
-    pdf_files = list(sdir.glob("*.pdf"))
-    xlsx_files = list(sdir.glob("*.xlsx"))
-    all_docs = docx_files + docm_files + pdf_files + xlsx_files
 
-    if not all_docs:
-        raise HTTPException(status_code=400, detail="Нет загруженных документов")
+class AnalyzeRequest(BaseModel):
+    overrides: dict[str, str] = {}        # {файл: тип документа} — исправления пользователя
+    choices: dict[str, list[str]] = {}    # {бланк: [проверяемые файлы]} — выбор из нескольких
 
-    # Поле 2 (проверяемый документ: План аудита или Сводный акт) обязательно.
-    if not plan_doc_file:
-        raise HTTPException(
-            status_code=400,
-            detail="Не загружен проверяемый документ (поле 2). Без него сверка невозможна — пайплайн остановлен."
-        )
 
-    # === Чек-листы из поля 1: один или два. Определяем тип каждого. ===
-    checklist_names = [template_file] + ([template_file_2] if template_file_2 else [])
-    checklists = []
-    for name in checklist_names:
-        cpath = sdir / name
-        if not cpath.exists():
-            possible_names = ["ИИ шаблон плана.docm", "ИИ -ЧК -План АУДИТА.docx", "ЧК -Сводный акт.docx"]
-            for alt in possible_names:
-                if (sdir / alt).exists():
-                    cpath = sdir / alt
-                    break
-            else:
-                raise HTTPException(status_code=400, detail=f"Чек-лист '{name}' не найден в сессии")
-        ctype = detect_checklist_type(str(cpath))
-        checklists.append({"name": cpath.name, "path": cpath, "type": ctype})
-        print(f"Чек-лист '{cpath.name}' → тип: {ctype}")
+class RunRequest(AnalyzeRequest):
+    checklists: list[str]                 # бланки (поле 1), которые проверить
+    api_key: str = ""                     # пусто — ключ из настроек сервера
 
-    recognized = [c for c in checklists if c["type"] in ("plan", "svod")]
-    if not recognized:
-        raise HTTPException(
-            status_code=400,
-            detail="Не удалось распознать тип чек-листа в поле 1 (ожидался «План АУДИТА» или «Сводный акт»)."
-        )
-    # Порядок обработки: сначала План, затем Сводный акт
-    recognized.sort(key=lambda c: 0 if c["type"] == "plan" else 1)
 
-    # Источники (поле 3) — всё, кроме самих чек-листов. Должен быть хотя бы 1 файл
-    # помимо проверяемого документа из поля 2.
-    checklist_set = {c["name"] for c in checklists}
-    field2_set = {f for f in (plan_doc_file, plan_doc_file_2) if f}
-    excluded_names = checklist_set | field2_set
-    sources_count = sum(1 for d in all_docs if d.name not in excluded_names)
-    if sources_count == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Нет файлов-источников в поле 3. Загрузите Договор, Приказ ЭГ, Заявку и пр. — без них сверка невозможна."
-        )
-
-    # Извлекаем текст из всех документов КРОМЕ чек-листов.
-    # ВАЖНО: эта работа CPU-bound (особенно OCR) — выносим в thread, иначе блокируется
-    # event loop и /api/status перестаёт отвечать (фронт не видит прогресс).
+@app.post("/api/sessions/{session_id}/analyze")
+async def analyze_session(session_id: str, req: Optional[AnalyzeRequest] = None):
+    """Разбор пакета: тип каждого бланка и документа, организации, какие чек-листы можно
+    запустить и с какими документами, предупреждения. Прогресс чтения файлов — в
+    /api/sessions/{id}/status (поле analysis)."""
     import asyncio
-
-    source_docs = [d for d in all_docs if d.name not in checklist_set]
-    total_files = len(source_docs)
-    processing_status.update({
-        "stage": "extract",
-        "current": 0,
-        "total": total_files,
-        "message": f"Извлечение текста из {total_files} файлов",
-        "detail": "",
-    })
-
-    EXTRACT_WORKERS = 3
-
-    def _extract_one(doc_file: Path):
-        """Извлечь текст одного файла. Возвращает (filename, text) или (filename, None) при ошибке."""
-        suffix = doc_file.suffix.lower()
-        try:
-            if suffix in ('.docx', '.docm'):
-                text = extract_text_from_docx(str(doc_file))
-            elif suffix == '.pdf':
-                text = extract_text_from_pdf(str(doc_file))
-            elif suffix == '.xlsx':
-                text = extract_text_from_xlsx(str(doc_file))
-            else:
-                print(f"Пропущен файл {doc_file.name} — неподдерживаемый формат")
-                return (doc_file.name, None)
-            return (doc_file.name, text)
-        except Exception as e:
-            print(f"ERR Ошибка чтения {doc_file.name}: {e}")
-            return (doc_file.name, None)
-
-    def _extract_all_texts_parallel():
-        """Параллельное извлечение в пуле потоков (3 файла одновременно)."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading
-
-        all_texts = {}
-        analyzed_files = []
-        in_progress = set()
-        lock = threading.Lock()
-        completed = 0
-
-        def update_status():
-            with lock:
-                names = ", ".join(sorted(in_progress)[:3])
-                processing_status.update({
-                    "stage": "extract",
-                    "current": completed,
-                    "total": total_files,
-                    "message": f"Файлы {completed}/{total_files} (параллельно x{EXTRACT_WORKERS})",
-                    "detail": f"в обработке: {names}" if names else "",
-                })
-
-        with ThreadPoolExecutor(max_workers=EXTRACT_WORKERS) as ex:
-            future_to_file = {}
-            for doc_file in source_docs:
-                fut = ex.submit(_extract_one, doc_file)
-                future_to_file[fut] = doc_file
-                with lock:
-                    in_progress.add(doc_file.name[:60])
-
-            update_status()
-
-            for fut in as_completed(future_to_file):
-                doc_file = future_to_file[fut]
-                fname, text = fut.result()
-                with lock:
-                    in_progress.discard(doc_file.name[:60])
-                    completed += 1
-                    if text is not None:
-                        all_texts[fname] = text
-                        analyzed_files.append(fname)
-                        print(f"OK Проанализирован ({completed}/{total_files}): {fname}")
-                update_status()
-
-        return all_texts, analyzed_files
-
-    all_texts, analyzed_files = await asyncio.to_thread(_extract_all_texts_parallel)
-
-    print(f"\nВсего проанализировано файлов: {len(analyzed_files)}")
-    print(f"Файлы: {analyzed_files}\n")
-
-    processing_status.update({
-        "stage": "extract",
-        "current": total_files,
-        "total": total_files,
-        "message": "Чтение проверяемого документа (поле 2)...",
-        "detail": "",
-    })
-
-    def _read_doc(p: Path) -> str:
-        suffix = p.suffix.lower()
-        if suffix in ('.docx', '.docm'):
-            return extract_text_from_docx(str(p))
-        elif suffix == '.pdf':
-            return extract_text_from_pdf(str(p))
-        elif suffix == '.xlsx':
-            return extract_text_from_xlsx(str(p))
-        return ""
-
-    # Проверяемые документы из поля 2 (1 или 2 файла: План аудита и/или Сводный акт).
-    field2_files = [plan_doc_file] + ([plan_doc_file_2] if plan_doc_file_2 else [])
-    field2_texts = []  # [(name, text), ...]
-    for name in field2_files:
-        p = sdir / name
-        if not p.exists():
-            raise HTTPException(status_code=400, detail=f"Файл (поле 2) '{name}' не найден в сессии")
-        try:
-            txt = await asyncio.to_thread(_read_doc, p)
-        except Exception as e:
-            print(f"WARN: Не удалось прочитать документ поля 2 {name}: {e}")
-            txt = ""
-        field2_texts.append((name, txt))
-
-    # Распределяем по типу: Сводный акт vs остальное (План аудита).
-    field2_svod_text = ""
-    field2_plan_text = ""
-    for name, txt in field2_texts:
-        if _looks_like_svod_doc(txt):
-            if not field2_svod_text:
-                field2_svod_text = txt
-        elif not field2_plan_text:
-            field2_plan_text = txt
-    # Фолбэк: если План не распознан, берём первый файл поля 2.
-    if not field2_plan_text and field2_texts:
-        field2_plan_text = field2_texts[0][1]
-
-    # Активная модель из настроек (с фолбэком на дефолт)
-    active_model = _get_active_model()
-    active_scope = _get_active_scope()
-
-    # Pre-flight: быстрая проверка GigaChat. Если auth/связь упали — ошибаемся сразу.
-    processing_status.update({
-        "stage": "preflight",
-        "current": 0,
-        "total": 1,
-        "message": f"Проверка соединения с GigaChat ({active_model})...",
-        "detail": "",
-    })
-    print("Preflight GigaChat...")
-    preflight = await asyncio.to_thread(gigachat_preflight, api_key, 8.0, active_model, active_scope)
-    if not preflight["ok"]:
-        raise HTTPException(
-            status_code=503,
-            detail=f"GigaChat недоступен ({preflight['stage']}): {preflight['detail']}"
-        )
-    print(f"Preflight OK. Доступные модели: {preflight['models']}")
-
-    def _normalize_counts(extracted: dict, structure: list):
-        """Приводим число результатов к числу пунктов чек-листа (обрезка/дополнение)."""
-        if "checklist" not in extracted:
-            return
-        actual = extracted["checklist"]
-        n = len(structure)
-        if len(actual) > n:
-            print(f"GigaChat вернул {len(actual)} пунктов, в документе {n}. Обрезано.")
-            extracted["checklist"] = actual[:n]
-        elif len(actual) < n:
-            for i in range(len(actual), n):
-                area_name = structure[i]['area'][:60] if i < len(structure) else f"пункт {i+1}"
-                extracted["checklist"].append({
-                    "ok": False, "nok": True,
-                    "reason": f"Нет данных для проверки: {area_name}",
-                    "problems": f"Нет данных для проверки: {area_name}",
-                    "ii_data_found": "",
-                })
-        for item in extracted["checklist"]:
-            item.setdefault("reason", item.get("problems", ""))
-            item.setdefault("ii_data_found", "")
-
-    session_out_dir = OUTPUT_DIR / session_id
-    session_out_dir.mkdir(parents=True, exist_ok=True)
-
-    outputs = []
-    first_extracted = None
-    first_validation = None
-
-    # === Обрабатываем каждый распознанный чек-лист (План → Сводный акт) ===
-    for c in recognized:
-        cpath = c["path"]
-        ctype = c["type"]
-        print(f"Запуск пайплайна для чек-листа '{cpath.name}' (тип {ctype}, модель {active_model})...")
-
-        if ctype == "plan":
-            # Проверяемый документ для Плана = файл поля 2, распознанный как План аудита
-            plan_doc_text = field2_plan_text
-            if not plan_doc_text or len(plan_doc_text.strip()) < 100:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Не удалось извлечь текст «Плана аудита» из поля 2. "
-                        f"Прочитано символов: {len(plan_doc_text.strip()) if plan_doc_text else 0}. "
-                        "Проверьте, что в поле 2 загружен правильный файл с Планом аудита."
-                    )
-                )
-            try:
-                template_text = await asyncio.to_thread(extract_text_from_docx, str(cpath))
-            except Exception as e:
-                print(f"WARN: текст шаблона Плана не извлечён: {e}")
-                template_text = ""
-            checklist_structure = extract_checklist_from_template(str(cpath))
-            ii_references = extract_ii_references(str(cpath))
-            print(f"[План] маркеры ИИ: {list(ii_references.keys())}, пунктов: {len(checklist_structure)}")
-
-            try:
-                extracted_data = await asyncio.to_thread(
-                    process_checklist_advanced,
-                    api_key, all_texts, checklist_structure, ii_references, active_model,
-                    plan_doc_text
-                )
-            except Exception as e:
-                processing_status.update({"stage": "error", "message": str(e)[:200]})
-                return ProcessingResult(status="error", message=f"Ошибка пайплайна (План): {str(e)}")
-            if "error" in extracted_data:
-                return ProcessingResult(status="error", message=extracted_data["error"])
-
-            _normalize_counts(extracted_data, checklist_structure)
-
-            output_filename = "Заполненный_План_АУДИТА.docx"
-            output_path = session_out_dir / output_filename
-            output_ref = f"{session_id}/{output_filename}"
-            processing_status.update({"stage": "fill", "message": "Заполнение Плана АУДИТА...", "detail": ""})
-            try:
-                await asyncio.to_thread(
-                    fill_plan_with_checklist,
-                    str(cpath), extracted_data, str(output_path), checklist_structure
-                )
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Ошибка заполнения Плана: {str(e)}")
-
-            processing_status.update({"stage": "validate", "message": "Валидация Плана...", "detail": ""})
-            validation = await validate_result(output_ref)
-
-            # Доп. сверка наименования юр.лица (План vs источники)
-            try:
-                applicant_check = await asyncio.to_thread(
-                    cross_check_applicant_name, api_key, plan_doc_text, all_texts, active_model
-                )
-            except Exception as e:
-                print(f"WARN: cross-check заявителя не выполнен: {e}")
-                applicant_check = None
-            if applicant_check and applicant_check.get("match") is False:
-                note = (
-                    f"Наименование заявителя в Плане и в источниках различается. "
-                    f"План (поле 2): «{applicant_check.get('plan_name') or '—'}». "
-                    f"Источники (поле 3): «{applicant_check.get('sources_name') or '—'}»."
-                )
-                if applicant_check.get("note"):
-                    note += f" {applicant_check['note']}"
-                notes = list(validation.get("notes") or [])
-                notes.append(note)
-                validation["notes"] = notes
-                validation["applicant_check"] = applicant_check
-
-        else:  # ctype == "svod"
-            # Проверяемый документ для Сводного акта = файл поля 2, распознанный как
-            # Сводный акт; иначе ищем среди источников (поле 3).
-            svod_doc_text = field2_svod_text
-            if not svod_doc_text:
-                for fn, txt in all_texts.items():
-                    if _looks_like_svod_doc(txt):
-                        svod_doc_text = txt
-                        print(f"[Сводный акт] проверяемый документ найден среди источников: {fn}")
-                        break
-            if not svod_doc_text or len(svod_doc_text.strip()) < 100:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Не найден проверяемый документ «Сводный акт исследования (итог)». "
-                        "Загрузите его в поле 2 либо в поле 3 (источники)."
-                    )
-                )
-            checklist_structure = extract_checklist_svod(str(cpath))
-            print(f"[Сводный акт] пунктов: {len(checklist_structure)}")
-
-            try:
-                extracted_data = await asyncio.to_thread(
-                    process_checklist_svod,
-                    api_key, all_texts, checklist_structure, active_model, svod_doc_text
-                )
-            except Exception as e:
-                processing_status.update({"stage": "error", "message": str(e)[:200]})
-                return ProcessingResult(status="error", message=f"Ошибка пайплайна (Сводный акт): {str(e)}")
-
-            _normalize_counts(extracted_data, checklist_structure)
-
-            output_filename = "Заполненный_Сводный_акт.docx"
-            output_path = session_out_dir / output_filename
-            output_ref = f"{session_id}/{output_filename}"
-            processing_status.update({"stage": "fill", "message": "Заполнение Сводного акта...", "detail": ""})
-            try:
-                await asyncio.to_thread(
-                    fill_svod_with_checklist,
-                    str(cpath), extracted_data, str(output_path), checklist_structure
-                )
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Ошибка заполнения Сводного акта: {str(e)}")
-
-            # Лёгкая валидация: счётчики (validate_result заточен под План)
-            results = extracted_data.get("checklist", [])
-            validation = {
-                "valid": True,
-                "issues": [],
-                "notes": [],
-                "ok_count": sum(1 for it in results if it.get("ok")),
-                "nok_count": sum(1 for it in results if it.get("nok")),
-                "manual_count": sum(1 for it in results if not it.get("ok") and not it.get("nok")),
-                "total": len(results),
-            }
-
-        # Сводка по этому чек-листу
-        results = extracted_data.get("checklist", []) if isinstance(extracted_data, dict) else []
-        outputs.append({
-            "type": ctype,
-            "checklist_file": cpath.name,
-            "output_file": output_ref,
-            "ok_count": sum(1 for it in results if it.get("ok")),
-            "nok_count": sum(1 for it in results if it.get("nok")),
-            "manual_count": sum(1 for it in results if not it.get("ok") and not it.get("nok")),
-            "total_items": len(results),
-            "header": extracted_data.get("header") if isinstance(extracted_data, dict) else None,
-            "checklist": results,
-            "validation": validation,
-        })
-        if first_extracted is None:
-            first_extracted = extracted_data
-            first_validation = validation
-
-    # === Сохраняем мета-данные сессии для админки ===
+    sdir = _existing_session(session_id)
+    req = req or AnalyzeRequest()
+    progress = _analysis_status(session_id)
     try:
-        first = outputs[0] if outputs else {}
-        _save_session_meta(
-            session_id,
-            finished_at=datetime.now().isoformat(timespec="seconds"),
-            template_file=template_file,
-            template_file_2=template_file_2,
-            plan_doc_file=plan_doc_file,
-            plan_doc_file_2=plan_doc_file_2,
-            source_files=[d.name for d in source_docs if d.name not in field2_set],
-            output_file=first.get("output_file"),
-            outputs=outputs,
-            model=active_model,
-            ok_count=first.get("ok_count"),
-            nok_count=first.get("nok_count"),
-            total_items=first.get("total_items"),
-            header=first_extracted.get("header") if isinstance(first_extracted, dict) else None,
-            checklist=first_extracted.get("checklist") if isinstance(first_extracted, dict) else None,
-            validation=first_validation,
-        )
-    except Exception as e:
-        print(f"WARN: meta сохранить не удалось: {e}")
+        analysis, _ = await asyncio.to_thread(
+            _analyze_session, session_id, sdir, req.overrides, req.choices, progress)
+    finally:
+        progress.update({"stage": "idle", "message": "", "detail": ""})
+    return analysis
 
-    types_done = ", ".join("Сводный акт" if o["type"] == "svod" else "План АУДИТА" for o in outputs)
-    return ProcessingResult(
-        status="success",
-        message=f"Обработано чек-листов: {len(outputs)} ({types_done}). Проанализировано файлов: {len(analyzed_files)}",
-        extracted_data=first_extracted,
-        output_file=outputs[0]["output_file"] if outputs else None,
-        outputs=outputs,
-        validation=first_validation,
-        analyzed_files=analyzed_files,
-    )
+
+@app.post("/api/sessions/{session_id}/run")
+async def run_session(session_id: str, req: RunRequest):
+    """Запуск проверки выбранных чек-листов в фоне. Результаты — в /api/sessions/{id}/status."""
+    sdir = _existing_session(session_id)
+    if not req.checklists:
+        raise HTTPException(status_code=400, detail="Не выбран ни один чек-лист")
+    llm = [n for n in req.checklists
+           if checklists.detect_checklist_type(str(sdir / n)) in package.LLM_CHECKLISTS]
+    api_key = (req.api_key or "").strip() or _load_settings().get("api_key", "")
+    if llm and not api_key:
+        raise HTTPException(status_code=400,
+                            detail="Для проверки Плана АУДИТА и Сводного акта нужен ключ GigaChat — "
+                                   "сохраните его в «Админ».")
+    status = _job_status(session_id)
+    with _JOBS_LOCK:
+        if status["running"]:
+            raise HTTPException(status_code=409, detail="Проверка этого пакета уже идёт")
+        status.clear()
+        status.update(_new_status())
+        status.update({"running": True, "stage": "start", "message": "Запуск проверки…",
+                       "started_at": datetime.now().isoformat(timespec="seconds")})
+    threading.Thread(target=_run_package_job, daemon=True,
+                     args=(session_id, sdir, api_key, req.checklists, req.overrides, req.choices)).start()
+    return {"status": "started"}
+
+
+@app.get("/api/sessions/{session_id}/status")
+async def session_status(session_id: str):
+    """Ход и результаты проверки сессии. После перезапуска сервера — результаты из meta."""
+    _existing_session(session_id)
+    status = dict(_job_status(session_id))
+    if not status["running"] and not status["outputs"]:
+        meta = _load_session_meta(session_id)
+        if meta.get("outputs"):
+            status.update({"stage": "done", "outputs": meta["outputs"],
+                           "finished_at": meta.get("finished_at")})
+    status["analysis"] = dict(_analysis_status(session_id))
+    return status
 
 
 @app.get("/api/admin/sessions")
@@ -5168,7 +5182,7 @@ async def admin_list_sessions(limit: int = 50):
             "total_items": meta.get("total_items"),
             "model": meta.get("model"),
             "output_file": meta.get("output_file"),
-            "applicant": (meta.get("header") or {}).get("Наименование Заявителя") if meta.get("header") else None,
+            "applicant": meta.get("applicant") or (meta.get("header") or {}).get("Наименование Заявителя"),
         })
     items.sort(key=lambda x: x.get("ts_sort") or "", reverse=True)
     return {"sessions": items[:limit], "total": len(items)}
@@ -5356,11 +5370,16 @@ async def delete_file(filename: str, session_id: Optional[str] = None):
     """Удаление загруженного файла из папки сессии."""
     if not session_id or not _SESSION_ID_RE.match(session_id):
         raise HTTPException(status_code=400, detail="Некорректный session_id")
-    file_path = UPLOAD_DIR / session_id / filename
-    if file_path.exists():
-        file_path.unlink()
-        return {"status": "ok", "message": f"Файл {filename} удален"}
-    raise HTTPException(status_code=404, detail="Файл не найден")
+    sdir = (UPLOAD_DIR / session_id).resolve()
+    file_path = (sdir / filename).resolve()
+    if file_path.parent != sdir or filename.startswith("_") or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    file_path.unlink()
+    meta = _load_session_meta(session_id)
+    if meta.get("blocks"):
+        _save_session_meta(session_id, blocks={k: [n for n in v if n != filename]
+                                               for k, v in meta["blocks"].items()})
+    return {"status": "ok", "message": f"Файл {filename} удален"}
 
 
 @app.post("/api/upload-from-path")
@@ -5403,12 +5422,6 @@ async def upload_from_path(
         _save_session_meta(sid, blocks=blocks)
 
     return {"status": "ok", "session_id": sid, "uploaded_files": uploaded, "count": len(uploaded)}
-
-
-@app.get("/api/status")
-def get_processing_status():
-    """Текущий статус обработки (для polling из UI во время /api/process)."""
-    return processing_status
 
 
 @app.get("/api/gigachat/diagnose")

@@ -19,3 +19,8 @@ frontend/.vite/
 .qwen/
 .idea/
 .vscode/
+
+# Локальные файлы сервера (DEPLOY.md, разделы 4–5)
+/docker-compose.override.yml
+/nginx-auth.conf
+/.htpasswd

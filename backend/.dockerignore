@@ -8,3 +8,5 @@ uploads/*
 outputs/*
 !uploads/.gitkeep
 !outputs/.gitkeep
+tests/
+requirements-dev.txt
