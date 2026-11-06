@@ -35,9 +35,8 @@ def test_every_item_has_rule(checklist_path):
 
 def test_akt_all_ok(checklist_path):
     r = akt(checklist_path)
-    manual = {n for n, (s, _) in r.items() if s == "manual"}
-    assert manual == {13}, r  # подстрока «в соответствии с п.24» — на ручную проверку
-    assert all(s == "ok" for n, (s, _) in r.items() if n != 13), r
+    assert all(s == "ok" for s, _ in r.values()), r
+    assert "есть обязательство разработать план КД" in r[13][1]   # подстрока «в соответствии с п.24»
     assert "в Разбивке детальнее: 28.13.14" in r[6][1]
 
 
@@ -63,6 +62,14 @@ def test_akt_compliance_and_counts(checklist_path):
     assert r[11][0] == "nok" and "частично" in r[11][1]       # п.14.4 при значительном НС
     r = akt(checklist_path, nc_23_2="3")
     assert r[15][0] == "nok"                                  # п.23.2 ≠ п.24
+
+
+def test_akt_p17_obligation_follows_p24(checklist_path):
+    r = akt(checklist_path, minor="0", nc_23_2="0")              # НС нет, а обязательство есть
+    assert r[13][0] == "nok" and "несоответствий нет" in r[13][1]
+    no_obligation = D.akt().replace("разработать план корректирующих действий", "представить отчет")
+    r = run(checklist_path, AKT_TPL, "akt", {"Акт.docx": no_obligation})
+    assert r[13][0] == "nok" and "нет обязательства" in r[13][1]
 
 
 def test_akt_deadlines(checklist_path):
@@ -134,7 +141,7 @@ def test_dki_package(samples_dir, checklist_path):
 
     r = run(checklist_path, AKT_TPL, "akt", {"Акт.docx": akt_text}, sources)
     assert r[1][0] == "nok"                    # Договор не загружен
-    assert r[13][0] == "manual"                # подстрока п.24
+    assert r[13][0] == "ok"                    # подстрока п.24: НС есть, обязательство есть
     assert r[12][0] == "nok" and "05.08.2026" in r[12][1]
     assert r[14][0] == "ok", r[14]             # 26.08.2026 = 20 р.д. с даты подписания
     assert all(r[n][0] == "ok" for n in r if n not in (1, 12, 13)), r

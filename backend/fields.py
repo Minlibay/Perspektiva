@@ -591,7 +591,7 @@ def akt_fields(text: str) -> dict:
     f["pkd_deadline"] = _deadline(r"представить\s+(?:его|план)|план корректирующих действий")
     f["kd_deadline"] = (_deadline(r"Сроки устранения несоответствий и вызвавших их причин")
                         or _deadline(r"отчет об устранении несоответствий"))
-    f["obligation_pkd"] = bool(re.search(r"разработать план корректирующих действий", t, re.IGNORECASE))
+    f["obligation_pkd"] = _find_phrase(t, "разработать план корректирующих действий") >= 0  # и с переносом строки
     f["extend"] = is_marked(t, "расширить область")
     f["narrow"] = is_marked(t, "сузить область")
 
