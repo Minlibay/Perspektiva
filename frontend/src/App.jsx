@@ -291,11 +291,15 @@ function App() {
       const res = await axios.post(`${API_BASE}/api/sessions/${sid}/analyze`,
         { overrides: ov, choices: ch }, { timeout: 30 * 60 * 1000 })
       setAnalysis(res.data)
+      const wasReady = Object.fromEntries((analysis?.checklists || []).map(c => [c.file, c.ready]))
       setSelected(prev => {
         const next = {}
-        // по умолчанию отмечено всё готовое; План и Сводный (GigaChat) — только если ключ сохранён
+        // по умолчанию отмечено всё готовое; План и Сводный (GigaChat) — только если ключ сохранён.
+        // Чек-лист, ставший готовым после распознавания скана, отмечается так же, как новый.
         for (const c of res.data.checklists) {
-          next[c.file] = c.file in prev ? prev[c.file] && c.ready : c.ready && (!c.needs_gigachat || apiKeySaved)
+          next[c.file] = c.file in prev && wasReady[c.file]
+            ? prev[c.file] && c.ready
+            : c.ready && (!c.needs_gigachat || apiKeySaved)
         }
         return next
       })
@@ -307,17 +311,24 @@ function App() {
     }
   }
 
-  // Прогресс чтения файлов, пока идёт разбор (OCR сканов может занять минуты)
+  // Сканы распознаются в фоне (OCR — минуты): показываем ход чтения, а когда оно закончится —
+  // разбираем пакет заново, уже с текстами сканов. Проверку можно запускать и раньше.
+  const readingCount = analysis?.reading?.length || 0
   useEffect(() => {
-    if (!analyzing || !sessionId) return
+    if (!readingCount || !sessionId || analyzing) return
     const id = setInterval(async () => {
       try {
         const res = await axios.get(`${API_BASE}/api/sessions/${sessionId}/status`)
-        if (res.data.analysis?.total) setAnalysisProgress(res.data.analysis)
+        const a = res.data.analysis || {}
+        setAnalysisProgress(a.total ? a : null)
+        if (!a.reading) {
+          clearInterval(id)
+          runAnalyze()
+        }
       } catch (e) { /* статус необязателен */ }
-    }, 800)
+    }, 1500)
     return () => clearInterval(id)
-  }, [analyzing, sessionId])
+  }, [readingCount, sessionId, analyzing, analysis])
 
   // Ход проверки: опрашиваем статус, пока идёт фоновая проверка
   useEffect(() => {
@@ -475,7 +486,9 @@ function App() {
               <option value="unknown">— тип не определён —</option>
               {(analysis?.doc_types || []).map(t => <option key={t.key} value={t.key}>{t.title}</option>)}
             </Form.Select>
-            {detectedBadge(f)}
+            {f.reading
+              ? <Badge bg="secondary" className="ms-1"><Spinner size="sm" className="me-1" style={{ width: '0.6rem', height: '0.6rem' }} />скан читается — тип по имени</Badge>
+              : detectedBadge(f)}
           </div>
           {(f.org || f.used_by.length > 0) && (
             <div className="text-muted mt-1">
@@ -585,10 +598,22 @@ function App() {
         ))}
       </Row>
 
-      {analyzing && (
+      {analyzing && !readingCount && (
         <Alert variant="secondary" className="py-2 small">
+          <Spinner size="sm" className="me-2" />Разбираю пакет…
+        </Alert>
+      )}
+
+      {readingCount > 0 && (
+        <Alert variant="info" className="py-2 small">
           <Spinner size="sm" className="me-2" />
-          {analysisProgress ? `${analysisProgress.message} · ${analysisProgress.detail || ''}` : 'Разбираю пакет…'}
+          <strong>Распознаются сканы ({readingCount})</strong>
+          {analysisProgress?.message ? ` — ${analysisProgress.message}` : ''}
+          {analysisProgress?.detail ? ` · ${analysisProgress.detail}` : ''}
+          <div className="mt-1">
+            Пока скан читается, его тип определён по имени файла и уточнится сам. Проверку можно
+            запускать сейчас — она дождётся распознавания.
+          </div>
         </Alert>
       )}
 

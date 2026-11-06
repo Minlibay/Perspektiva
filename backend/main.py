@@ -424,6 +424,7 @@ def extract_text_from_docx(file_path: str) -> str:
 
 
 _OCR_DPI = int(os.environ.get("OCR_DPI", "200"))
+_OCR_MIN_CHARS = 100  # меньше символов текстового слоя на страницу — PDF считается сканом
 _OCR_LANG = os.environ.get("OCR_LANG", "rus+eng")
 
 
@@ -571,9 +572,9 @@ def extract_text_from_pdf(file_path: str) -> str:
             texts.append(text)
     body = "\n".join(texts)
 
-    # Триггер OCR: если на страницу приходится меньше 100 символов — считаем что это скан
+    # Триггер OCR: если на страницу приходится меньше _OCR_MIN_CHARS символов — считаем что это скан
     avg_per_page = (len(body) / page_count) if page_count else 0
-    if page_count > 0 and avg_per_page < 100:
+    if page_count > 0 and avg_per_page < _OCR_MIN_CHARS:
         print(f"[ocr] {Path(file_path).name}: текстовый слой пуст ({avg_per_page:.0f} симв/стр), запускаю OCR...")
         try:
             ocr_text = _ocr_pdf_with_cache(file_path)
@@ -4886,50 +4887,109 @@ def _extract_text(path: Path) -> Optional[str]:
 
 
 _EXTRACT_WORKERS = 3
+_READ_LOCKS: dict = {}  # session_id → кто сейчас распознаёт сканы сессии: фоновое чтение или проверка
 
 
-def _session_texts(session_id: str, sdir: Path, names: list, status: dict) -> dict:
-    """Тексты файлов сессии с кэшем на диске (_texts.json): повторный разбор пакета и запуск
-    проверки не читают файлы заново — OCR сканов идёт минутами. Кэш сбрасывается для файла,
-    у которого поменялись размер или время изменения."""
+def _read_lock(session_id: str) -> threading.Lock:
+    with _JOBS_LOCK:
+        return _READ_LOCKS.setdefault(session_id, threading.Lock())
+
+
+def _pdf_needs_ocr(path: Path) -> bool:
+    """Скан без текстового слоя: читается OCR — минуты, а не мгновенно."""
+    try:
+        pages = PdfReader(str(path)).pages
+        return len(pages) > 0 and len("".join(p.extract_text() or "" for p in pages)) / len(pages) < _OCR_MIN_CHARS
+    except Exception:
+        return False
+
+
+def _text_cache(sdir: Path) -> dict:
+    try:
+        return json.loads((sdir / "_texts.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _session_texts(session_id: str, sdir: Path, names: list, status: dict, ocr: bool = True) -> tuple:
+    """(тексты файлов сессии, сканы, которые ещё не распознаны).
+
+    Кэш на диске (_texts.json): повторный разбор пакета и запуск проверки не читают файлы
+    заново. Кэш сбрасывается для файла, у которого поменялись размер или время изменения.
+    ocr=False — быстрый разбор: сканы без кэша не распознаются, а возвращаются вторым
+    значением (их распознаёт фоновое чтение или запуск проверки). Каждый прочитанный файл
+    сразу пишется в кэш — быстрый разбор видит распознанное по ходу фонового чтения."""
     with _session_lock(session_id):
-        cache_path = sdir / "_texts.json"
+        cache = _text_cache(sdir)
+    texts, todo, pending = {}, [], []
+    for name in names:
         try:
-            cache = json.loads(cache_path.read_text(encoding="utf-8"))
-        except Exception:
-            cache = {}
-        texts, todo = {}, []
-        for name in names:
-            try:
-                st = (sdir / name).stat()
-            except OSError:
-                continue
-            stamp = f"ocr{OCR_VERSION}:{st.st_size}:{int(st.st_mtime)}"
-            hit = cache.get(name)
-            if hit and hit.get("stamp") == stamp:
-                texts[name] = hit.get("text")
-            else:
-                todo.append((name, stamp))
+            st = (sdir / name).stat()
+        except OSError:
+            continue
+        stamp = f"ocr{OCR_VERSION}:{st.st_size}:{int(st.st_mtime)}"
+        hit = cache.get(name)
+        if hit and hit.get("stamp") == stamp:
+            texts[name] = hit.get("text")
+        elif not ocr and name.lower().endswith(".pdf") and _pdf_needs_ocr(sdir / name):
+            pending.append(name)
+        else:
+            todo.append((name, stamp))
 
-        if todo:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            status.update({"stage": "extract", "current": 0, "total": len(todo),
-                           "message": f"Чтение файлов: 0 из {len(todo)}", "detail": ""})
-            done = 0
-            with ThreadPoolExecutor(max_workers=_EXTRACT_WORKERS) as ex:
-                futures = {ex.submit(_extract_text, sdir / name): (name, stamp) for name, stamp in todo}
-                for fut in as_completed(futures):
-                    name, stamp = futures[fut]
-                    text = fut.result()
-                    texts[name] = text
-                    cache[name] = {"stamp": stamp, "text": text}
-                    done += 1
-                    status.update({"current": done, "message": f"Чтение файлов: {done} из {len(todo)}",
-                                   "detail": name})
-        for stale in set(cache) - set(names):
-            cache.pop(stale, None)
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-        return texts
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        status.update({"stage": "extract", "current": 0, "total": len(todo),
+                       "message": f"Чтение файлов: 0 из {len(todo)}", "detail": ""})
+        done = 0
+        with ThreadPoolExecutor(max_workers=_EXTRACT_WORKERS) as ex:
+            futures = {ex.submit(_extract_text, sdir / name): (name, stamp) for name, stamp in todo}
+            for fut in as_completed(futures):
+                name, stamp = futures[fut]
+                texts[name] = fut.result()
+                with _session_lock(session_id):
+                    cache = _text_cache(sdir)
+                    cache[name] = {"stamp": stamp, "text": texts[name]}
+                    (sdir / "_texts.json").write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+                done += 1
+                status.update({"current": done, "message": f"Чтение файлов: {done} из {len(todo)}",
+                               "detail": name})
+    with _session_lock(session_id):
+        cache = _text_cache(sdir)
+        stale = set(cache) - {f["name"] for f in _list_session_files(sdir)}
+        if stale:
+            for name in stale:
+                cache.pop(name, None)
+            (sdir / "_texts.json").write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    return texts, pending
+
+
+def _start_background_reading(session_id: str, sdir: Path):
+    """Распознавание сканов сессии в фоне: оператор не ждёт OCR, чтобы отметить чек-листы и
+    запустить проверку. Прогресс — в /status (поле analysis, reading=True). Файлы,
+    загруженные во время чтения, дочитываются следующим проходом."""
+    progress = _analysis_status(session_id)
+    with _JOBS_LOCK:
+        if progress.get("reading"):
+            return
+        progress["reading"] = True
+
+    def work():
+        _status_local.status = progress  # «OCR файл: стр N/M» — в прогресс чтения
+        try:
+            while True:
+                names = [f["name"] for f in _session_package_files(session_id, sdir)]
+                with _read_lock(session_id):
+                    _session_texts(session_id, sdir, names, progress)
+                if {f["name"] for f in _session_package_files(session_id, sdir)} <= set(names):
+                    break
+        except Exception as e:
+            print(f"[read {session_id[:8]}] ошибка фонового чтения: {e}")
+        finally:
+            _status_local.status = None
+            progress.update({"reading": False, "stage": "idle", "current": 0, "total": 0,
+                             "message": "", "detail": ""})
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 def _session_package_files(session_id: str, sdir: Path) -> list:
@@ -4940,13 +5000,38 @@ def _session_package_files(session_id: str, sdir: Path) -> list:
             for f in _list_session_files(sdir)]
 
 
-def _analyze_session(session_id: str, sdir: Path, overrides: dict, choices: dict, status: dict):
-    """(разбор пакета, файлы с текстами)."""
+def _analyze_session(session_id: str, sdir: Path, overrides: dict, choices: dict, status: dict,
+                     ocr: bool = True):
+    """(разбор пакета, файлы с текстами).
+
+    ocr=False — быстрый разбор: нераспознанные сканы определяются по имени и помечаются
+    reading=True (список — в analysis["reading"]). ocr=True — все файлы с текстами (для
+    проверки): если сканы сейчас читает фоновое чтение, ждём его, показывая его ход в status."""
     files = _session_package_files(session_id, sdir)
-    texts = _session_texts(session_id, sdir, [f["name"] for f in files], status)
+    names = [f["name"] for f in files]
+    if ocr:
+        lock = _read_lock(session_id)
+        while not lock.acquire(timeout=1):
+            p = _analysis_status(session_id)
+            status.update({"stage": "extract", "message": "Распознавание сканов: " + (p.get("message") or "…"),
+                           "detail": p.get("detail") or "", "current": p.get("current", 0),
+                           "total": p.get("total", 0)})
+        try:
+            texts, pending = _session_texts(session_id, sdir, names, status)
+        finally:
+            lock.release()
+    else:
+        texts, pending = _session_texts(session_id, sdir, names, status, ocr=False)
     for f in files:
         f["text"] = texts.get(f["name"])
-    return package.analyze_package(files, overrides, choices), files
+    analysis = package.analyze_package(files, overrides, choices)
+    for f in analysis["files"]:
+        f["reading"] = f["name"] in pending
+    analysis["reading"] = pending
+    # Предупреждения о скане, который ещё читается («тип не определён», «не проверяется ни
+    # одним чек-листом»), — не ошибки: тип по имени предварительный и уточнится после OCR
+    analysis["warnings"] = [w for w in analysis["warnings"] if not any(f"«{n}»" in w for n in pending)]
+    return analysis, files
 
 
 def _normalize_counts(extracted: dict, structure: list):
@@ -5158,17 +5243,18 @@ class RunRequest(AnalyzeRequest):
 @app.post("/api/sessions/{session_id}/analyze")
 async def analyze_session(session_id: str, req: Optional[AnalyzeRequest] = None):
     """Разбор пакета: тип каждого бланка и документа, организации, какие чек-листы можно
-    запустить и с какими документами, предупреждения. Прогресс чтения файлов — в
-    /api/sessions/{id}/status (поле analysis)."""
+    запустить и с какими документами, предупреждения.
+
+    Быстрый: сканы, которые ещё не распознаны, определяются по имени (reading=True у файла,
+    список — в поле reading) и распознаются в фоне. Ход чтения — в /api/sessions/{id}/status
+    (поле analysis); когда reading там станет false, повторный разбор даст полные данные."""
     import asyncio
     sdir = _existing_session(session_id)
     req = req or AnalyzeRequest()
-    progress = _analysis_status(session_id)
-    try:
-        analysis, _ = await asyncio.to_thread(
-            _analyze_session, session_id, sdir, req.overrides, req.choices, progress)
-    finally:
-        progress.update({"stage": "idle", "message": "", "detail": ""})
+    analysis, _ = await asyncio.to_thread(
+        _analyze_session, session_id, sdir, req.overrides, req.choices, {}, False)
+    if analysis["reading"]:
+        _start_background_reading(session_id, sdir)
     return analysis
 
 

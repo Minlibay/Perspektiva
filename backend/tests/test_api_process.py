@@ -218,3 +218,48 @@ def test_status_restored_from_meta_after_restart(package, monkeypatch):
 def test_bad_session(client):
     assert client.post("/api/sessions/zzz/analyze", json={}).status_code == 400
     assert client.get(f"/api/sessions/{'cd' * 16}/status").status_code == 404
+
+
+def test_scans_are_read_in_background(client, checklist_path, monkeypatch):
+    """Разбор не ждёт OCR: скан определяется по имени и читается в фоне. Проверку можно
+    запустить сразу — она дождётся распознавания."""
+    import threading
+    monkeypatch.setattr(main, "_READ_LOCKS", {})
+    ocr_done = threading.Event()
+    real_extract = main._extract_text
+
+    def slow_extract(path):
+        if path.suffix == ".pdf":
+            ocr_done.wait(10)                                  # «OCR идёт минуты»
+            return S1.AKT
+        return real_extract(path)
+
+    monkeypatch.setattr(main, "_extract_text", slow_extract)
+    monkeypatch.setattr(main, "_pdf_needs_ocr", lambda p: p.suffix == ".pdf")
+    upload(client, "checklist", template(checklist_path, "Чек лист ПКД.docx"))
+    upload(client, "plan", {"План КД.docx": _docx_bytes(S1.PKD.splitlines())})
+    upload(client, "sources", {"Акт.pdf": b"%PDF-1.4 scan"})
+
+    a = analyze(client)                                        # вернулся, не дожидаясь OCR
+    assert a["reading"] == ["Акт.pdf"]
+    akt = next(f for f in a["files"] if f["name"] == "Акт.pdf")
+    assert akt["reading"] and akt["doc_type"] == "akt" and akt["detected_by"] == "name"
+    assert client.get(f"/api/sessions/{SESSION}/status").json()["analysis"]["reading"]
+
+    r = client.post(f"/api/sessions/{SESSION}/run", json={"checklists": ["Чек лист ПКД.docx"]})
+    assert r.status_code == 200
+    for _ in range(100):
+        st = client.get(f"/api/sessions/{SESSION}/status").json()
+        if "Распознавание сканов" in (st.get("message") or ""):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("проверка не ждёт распознавания")
+    ocr_done.set()
+    for _ in range(300):                                       # проверка уже запущена — ждём её
+        st = client.get(f"/api/sessions/{SESSION}/status").json()
+        if not st["running"] and not st["analysis"]["reading"]:
+            break
+        time.sleep(0.05)
+    assert by_title(st)["ПКД"]["ok_count"] == 3                # Акт из скана использован
+    assert analyze(client)["reading"] == []                    # скан в кэше
