@@ -132,7 +132,10 @@ def _same_date(doc_date, ref_date, what: str, src: str) -> dict:
 
 def _not_later(doc_date, deadline, what: str, deadline_label: str) -> dict:
     if not doc_date:
-        return _manual(f"{what} в документе не распознана")
+        # на скане дату утверждения часто вписывают от руки — OCR её не читает; даём срок,
+        # чтобы аудитору осталось сверить дату глазами
+        hint = f" — сверьте по скану: не позднее {F.fmt_date(deadline)}, это {deadline_label}" if deadline else ""
+        return _manual(f"{what} в документе не распознана{hint}")
     if not deadline:
         return _manual(f"не распознан {deadline_label}")
     if doc_date > deadline:
@@ -780,7 +783,10 @@ def _zakl_date(ctx: Ctx) -> dict:
             return _nok(f"дата утверждения {F.fmt_date(f['approval_date'])} ≠ дате подписания "
                         f"{F.fmt_date(f['sign_date'])}")
         if not kd["date"]:
-            return _manual(f"дата утверждения Отчета по КД («{kd_name}») не распознана")
+            # Заключение ≤ Отчет по КД + 5 р.д. ⇔ Отчет по КД утверждён не раньше Заключения − 5 р.д.
+            return _manual(f"дата утверждения Отчета по КД («{kd_name}») не распознана — сверьте по скану: "
+                           f"Отчет по КД утверждён не раньше {F.fmt_date(F.add_workdays(f['approval_date'], -5))} "
+                           f"(Заключение {F.fmt_date(f['approval_date'])} — не позднее Отчета по КД + 5 р.д.)")
         limit = _plus_workdays(kd["date"], 5)
         if f["approval_date"] > limit:
             return _nok(f"утверждено {F.fmt_date(f['approval_date'])}, позже Отчета по КД "
