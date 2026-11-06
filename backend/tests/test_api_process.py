@@ -220,46 +220,48 @@ def test_bad_session(client):
     assert client.get(f"/api/sessions/{'cd' * 16}/status").status_code == 404
 
 
-def test_scans_are_read_in_background(client, checklist_path, monkeypatch):
-    """Разбор не ждёт OCR: скан определяется по имени и читается в фоне. Проверку можно
-    запустить сразу — она дождётся распознавания."""
+def test_scans_are_read_only_when_check_starts(client, checklist_path, monkeypatch):
+    """Загрузка и разбор не распознают сканы: скан определяется по имени, OCR идёт только после
+    «Проверить выбранные». Чек-лист без документа (он мог оказаться среди сканов) — в
+    результатах с причиной, а не молча пропущен."""
     import threading
-    monkeypatch.setattr(main, "_READ_LOCKS", {})
-    ocr_done = threading.Event()
+    ocr_started, ocr_done = threading.Event(), threading.Event()
     real_extract = main._extract_text
 
     def slow_extract(path):
         if path.suffix == ".pdf":
+            ocr_started.set()
             ocr_done.wait(10)                                  # «OCR идёт минуты»
             return S1.AKT
         return real_extract(path)
 
     monkeypatch.setattr(main, "_extract_text", slow_extract)
     monkeypatch.setattr(main, "_pdf_needs_ocr", lambda p: p.suffix == ".pdf")
-    upload(client, "checklist", template(checklist_path, "Чек лист ПКД.docx"))
+    upload(client, "checklist", {**template(checklist_path, "Чек лист ПКД.docx"),
+                                 **template(checklist_path, "Чек лист ПН.docx")})
     upload(client, "plan", {"План КД.docx": _docx_bytes(S1.PKD.splitlines())})
     upload(client, "sources", {"Акт.pdf": b"%PDF-1.4 scan"})
 
-    a = analyze(client)                                        # вернулся, не дожидаясь OCR
-    assert a["reading"] == ["Акт.pdf"]
+    a = analyze(client)                                        # вернулся, не распознавая скан
+    assert a["reading"] == ["Акт.pdf"] and not ocr_started.is_set()
     akt = next(f for f in a["files"] if f["name"] == "Акт.pdf")
     assert akt["reading"] and akt["doc_type"] == "akt" and akt["detected_by"] == "name"
-    assert client.get(f"/api/sessions/{SESSION}/status").json()["analysis"]["reading"]
+    time.sleep(0.2)
+    assert not ocr_started.is_set()                            # и в фоне ничего не читается
 
-    r = client.post(f"/api/sessions/{SESSION}/run", json={"checklists": ["Чек лист ПКД.docx"]})
+    r = client.post(f"/api/sessions/{SESSION}/run",
+                    json={"checklists": ["Чек лист ПКД.docx", "Чек лист ПН.docx"]})
     assert r.status_code == 200
-    for _ in range(100):
-        st = client.get(f"/api/sessions/{SESSION}/status").json()
-        if "Распознавание сканов" in (st.get("message") or ""):
-            break
-        time.sleep(0.02)
-    else:
-        pytest.fail("проверка не ждёт распознавания")
+    assert ocr_started.wait(5)                                 # распознавание — по кнопке
+    st = client.get(f"/api/sessions/{SESSION}/status").json()
+    assert st["running"] and "Чтение файлов" in st["message"]
     ocr_done.set()
-    for _ in range(300):                                       # проверка уже запущена — ждём её
+    for _ in range(300):
         st = client.get(f"/api/sessions/{SESSION}/status").json()
-        if not st["running"] and not st["analysis"]["reading"]:
+        if not st["running"]:
             break
         time.sleep(0.05)
-    assert by_title(st)["ПКД"]["ok_count"] == 3                # Акт из скана использован
+    out = by_title(st)
+    assert out["ПКД"]["ok_count"] == 3                         # Акт из скана использован
+    assert "Не проверен" in out["Протоколы несоответствий"]["error"]
     assert analyze(client)["reading"] == []                    # скан в кэше

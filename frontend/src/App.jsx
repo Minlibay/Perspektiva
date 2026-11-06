@@ -118,7 +118,6 @@ function App() {
   const [sessionId, setSessionId] = useState(null)
   const [analysis, setAnalysis] = useState(null)          // разбор пакета: файлы, чек-листы, предупреждения
   const [analyzing, setAnalyzing] = useState(false)
-  const [analysisProgress, setAnalysisProgress] = useState(null)
   const [overrides, setOverrides] = useState({})          // {файл: тип документа} — исправления пользователя
   const [choices, setChoices] = useState({})              // {бланк: [проверяемые файлы]}
   const [selected, setSelected] = useState({})            // {бланк: проверять ли}
@@ -307,28 +306,27 @@ function App() {
       setError(e.response?.data?.detail || 'Не удалось разобрать пакет')
     } finally {
       setAnalyzing(false)
-      setAnalysisProgress(null)
     }
   }
 
-  // Сканы распознаются в фоне (OCR — минуты): показываем ход чтения, а когда оно закончится —
-  // разбираем пакет заново, уже с текстами сканов. Проверку можно запускать и раньше.
+  // Сканы распознаются только при проверке (OCR — минуты). Пакет могли открыть в двух вкладках:
+  // если проверку запустили в другой, подхватываем её ход и результаты, чтобы эта вкладка не
+  // показывала нераспознанные сканы после того, как они уже прочитаны.
   const readingCount = analysis?.reading?.length || 0
   useEffect(() => {
-    if (!readingCount || !sessionId || analyzing) return
+    if (!readingCount || !sessionId || job?.running) return
     const id = setInterval(async () => {
       try {
         const res = await axios.get(`${API_BASE}/api/sessions/${sessionId}/status`)
-        const a = res.data.analysis || {}
-        setAnalysisProgress(a.total ? a : null)
-        if (!a.reading) {
-          clearInterval(id)
-          runAnalyze()
+        const finishedElsewhere = res.data.finished_at && res.data.finished_at !== job?.finished_at
+        if (res.data.running || finishedElsewhere) {
+          setJob(res.data)
+          if (!res.data.running) runAnalyze()
         }
       } catch (e) { /* статус необязателен */ }
-    }, 1500)
+    }, 3000)
     return () => clearInterval(id)
-  }, [readingCount, sessionId, analyzing, analysis])
+  }, [readingCount, sessionId, job?.running, job?.finished_at])
 
   // Ход проверки: опрашиваем статус, пока идёт фоновая проверка
   useEffect(() => {
@@ -337,6 +335,8 @@ function App() {
       try {
         const res = await axios.get(`${API_BASE}/api/sessions/${sessionId}/status`)
         setJob(res.data)
+        // проверка распознала сканы — разбираем пакет заново: типы и организации уже по тексту
+        if (!res.data.running) runAnalyze()
       } catch (e) { /* повторим */ }
     }, 1000)
     return () => clearInterval(id)
@@ -436,7 +436,9 @@ function App() {
     setError(null)
   }
 
-  const checklistsToRun = (analysis?.checklists || []).filter(c => c.ready && selected[c.file])
+  // не готовый чек-лист можно отметить, пока есть нераспознанные сканы: документ для него может
+  // оказаться среди них (иначе сервер вернёт его с причиной «Не проверен»)
+  const checklistsToRun = (analysis?.checklists || []).filter(c => (c.ready || readingCount > 0) && selected[c.file])
   const needsKey = checklistsToRun.some(c => c.needs_gigachat) && !apiKeySaved
 
   const startRun = async () => {
@@ -487,7 +489,7 @@ function App() {
               {(analysis?.doc_types || []).map(t => <option key={t.key} value={t.key}>{t.title}</option>)}
             </Form.Select>
             {f.reading
-              ? <Badge bg="secondary" className="ms-1"><Spinner size="sm" className="me-1" style={{ width: '0.6rem', height: '0.6rem' }} />скан читается — тип по имени</Badge>
+              ? <Badge bg="secondary" className="ms-1" title="Скан распознается при проверке, тип пока определён по имени файла">скан · по имени</Badge>
               : detectedBadge(f)}
           </div>
           {(f.org || f.used_by.length > 0) && (
@@ -604,16 +606,11 @@ function App() {
         </Alert>
       )}
 
-      {readingCount > 0 && (
+      {readingCount > 0 && !job?.running && (
         <Alert variant="info" className="py-2 small">
-          <Spinner size="sm" className="me-2" />
-          <strong>Распознаются сканы ({readingCount})</strong>
-          {analysisProgress?.message ? ` — ${analysisProgress.message}` : ''}
-          {analysisProgress?.detail ? ` · ${analysisProgress.detail}` : ''}
-          <div className="mt-1">
-            Пока скан читается, его тип определён по имени файла и уточнится сам. Проверку можно
-            запускать сейчас — она дождётся распознавания.
-          </div>
+          <strong>Сканы PDF ({readingCount}) распознаются при проверке.</strong> Пока их тип определён по
+          имени файла — проверьте его в списке под файлом. Распознавание начнётся после «Проверить
+          выбранные» (около 20 секунд на 8-страничный скан), тип и организация уточнятся сами.
         </Alert>
       )}
 
@@ -635,12 +632,17 @@ function App() {
               <tbody>
                 {analysis.checklists.map(c => (
                   <tr key={c.file} className={c.ready ? '' : 'text-muted'}>
-                    <td><Form.Check type="checkbox" checked={!!selected[c.file]} disabled={!c.ready || job?.running}
+                    <td><Form.Check type="checkbox" checked={!!selected[c.file]}
+                                    disabled={(!c.ready && !readingCount) || job?.running}
                                     onChange={(e) => setSelected(prev => ({ ...prev, [c.file]: e.target.checked }))}
                                     aria-label={c.title} /></td>
                     <td><strong>{c.title}</strong><div className="small text-muted">{c.file}</div></td>
                     <td className="small">
                       {!c.ready && <span className="text-danger">{c.problem}</span>}
+                      {!c.ready && readingCount > 0 && (
+                        <div className="text-muted">Документ может оказаться среди нераспознанных сканов — отметьте
+                          чек-лист, если он загружен: при проверке станет ясно.</div>
+                      )}
                       {c.ready && !c.multi && c.candidates.length > 1 && (
                         <Form.Select size="sm" value={c.selected[0]} disabled={job?.running}
                                      onChange={(e) => changeChoice(c.file, [e.target.value])}>

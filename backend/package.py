@@ -9,11 +9,32 @@
 """
 
 import hashlib
+from collections import Counter
+from difflib import SequenceMatcher
 from typing import Optional
 
 import checklists
 import doc_types
 import fields as F
+
+def _same_core(a: str, b: str) -> bool:
+    """Одна организация, если названия совпадают или отличаются ошибкой OCR в букве-двух
+    («Зявод «Инвертор»» = «Завод «Инвертор»»). Для предупреждений о «документах других
+    организаций»; строгую сверку наименования делают пункты чек-листов."""
+    return a == b or (min(len(a), len(b)) >= 6 and SequenceMatcher(None, a, b).ratio() >= 0.85)
+
+
+def _canonical_cores(cores: list) -> dict:
+    """{название: название группы} — похожие названия сводятся к самому частому."""
+    canon, reps = {}, []
+    for core, _ in Counter(cores).most_common():
+        rep = next((r for r in reps if _same_core(core, r)), None)
+        if rep is None:
+            reps.append(core)
+            rep = core
+        canon[core] = rep
+    return canon
+
 
 FIELDS = ("checklist", "plan", "sources")
 FIELD_TITLES = {"checklist": "поле 1", "plan": "поле 2", "sources": "поле 3"}
@@ -93,6 +114,10 @@ def analyze_package(files: list, overrides: Optional[dict] = None,
         out_files.append(entry)
 
     docs = [e for e in out_files if e["kind"] == "document"]
+    canon = _canonical_cores([d["org_core"] for d in docs if d["org_core"]])
+    for d in docs:
+        if d["org_core"]:
+            d["org_core"] = canon[d["org_core"]]
 
     # --- чек-листы и их проверяемые документы ---
     out_checklists = []

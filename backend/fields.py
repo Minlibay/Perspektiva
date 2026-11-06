@@ -164,8 +164,9 @@ def normalize_org_name(name: str) -> tuple[str, str]:
             opf = head
             s = parts[1] if len(parts) > 1 else ''
 
-    # ядро — буквы и цифры (выкидываем пунктуацию и пробелы для устойчивого сравнения)
-    core = re.sub(r'[^0-9a-zа-яё]+', '', s)
+    # ядро — буквы и цифры (выкидываем пунктуацию и пробелы для устойчивого сравнения);
+    # латинские двойники кириллицы от OCR («Инвepтop») — кириллицей
+    core = re.sub(r'[^0-9a-zа-яё]+', '', s).translate(_LAT2CYR_CORE)
     return (opf, core)
 
 
@@ -233,6 +234,7 @@ def find_org(text: str, last: bool = False) -> Optional[dict]:
 
 # Латинские буквы, неотличимые от кириллических: OCR ставит их в инициалы и аббревиатуры
 _LAT2CYR = str.maketrans("ABCEHKMOPTXaceopx", "АВСЕНКМОРТХасеорх")
+_LAT2CYR_CORE = str.maketrans("abcehkmoptxy", "авсенкмортху")  # строчные — для ядра названия
 
 _SURNAME = r"([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)(?![\dА-Яа-яЁё])"
 _PERSON_RES = [
@@ -698,9 +700,14 @@ def approved_doc_fields(text: str) -> dict:
     i = t.lower().find("наименование проверяемой организации полностью")
     block = t[max(0, i - 300): i] if i >= 0 else t[:1500]
     approve = _segment(t, r"УТВЕРЖДАЮ", None, 400)
+    approval_date = first_date(approve)
     return {
         "org": find_org(block, last=True) or find_org(t),
-        "date": first_date(approve),
+        "date": approval_date,
+        # Скан, в блоке «УТВЕРЖДАЮ» напечатан только год (««16» 07 2026г.» — день и месяц от руки):
+        # рукописные цифры OCR не читает
+        "date_handwritten": (not approval_date and "=== OCR-ТЕКСТ" in t
+                             and bool(re.search(r"20\d\d\s*г", approve))),
         "rows": count_table_rows(t),
     }
 

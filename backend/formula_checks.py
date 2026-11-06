@@ -130,12 +130,13 @@ def _same_date(doc_date, ref_date, what: str, src: str) -> dict:
     return _ok(f"{what} {F.fmt_date(doc_date)} совпадает ({src})")
 
 
-def _not_later(doc_date, deadline, what: str, deadline_label: str) -> dict:
+def _not_later(doc_date, deadline, what: str, deadline_label: str, handwritten: bool = False) -> dict:
     if not doc_date:
-        # на скане дату утверждения часто вписывают от руки — OCR её не читает; даём срок,
-        # чтобы аудитору осталось сверить дату глазами
-        hint = f" — сверьте по скану: не позднее {F.fmt_date(deadline)}, это {deadline_label}" if deadline else ""
-        return _manual(f"{what} в документе не распознана{hint}")
+        # даём срок, чтобы аудитору осталось сверить дату глазами
+        hint = f": не позднее {F.fmt_date(deadline)}, это {deadline_label}" if deadline else ""
+        if handwritten:
+            return _manual(f"{what} вписана от руки — распознать не могу, проверьте вручную{hint}")
+        return _manual(f"{what} в документе не распознана — проверьте вручную{hint}")
     if not deadline:
         return _manual(f"не распознан {deadline_label}")
     if doc_date > deadline:
@@ -167,7 +168,8 @@ def _pkd_date(ctx: Ctx) -> dict:
     if not akt_file:
         return _nok(NO_AKT)
     return ctx.each(F.approved_doc_fields, lambda f: _not_later(
-        f["date"], akt["pkd_deadline"], "Дата утверждения ПКД", "срок представления плана КД (п.17 Акта)"))
+        f["date"], akt["pkd_deadline"], "Дата утверждения ПКД", "срок представления плана КД (п.17 Акта)",
+        f["date_handwritten"]))
 
 
 def _kd_date(ctx: Ctx) -> dict:
@@ -175,7 +177,8 @@ def _kd_date(ctx: Ctx) -> dict:
     if not akt_file:
         return _nok(NO_AKT)
     return ctx.each(F.approved_doc_fields, lambda f: _not_later(
-        f["date"], akt["kd_deadline"], "Дата утверждения отчета", "срок представления отчета (п.18 Акта, Акт6)"))
+        f["date"], akt["kd_deadline"], "Дата утверждения отчета", "срок представления отчета (п.18 Акта, Акт6)",
+        f["date_handwritten"]))
 
 
 def _approved_rows(ctx: Ctx) -> dict:
@@ -784,7 +787,8 @@ def _zakl_date(ctx: Ctx) -> dict:
                         f"{F.fmt_date(f['sign_date'])}")
         if not kd["date"]:
             # Заключение ≤ Отчет по КД + 5 р.д. ⇔ Отчет по КД утверждён не раньше Заключения − 5 р.д.
-            return _manual(f"дата утверждения Отчета по КД («{kd_name}») не распознана — сверьте по скану: "
+            how = "вписана от руки — распознать не могу" if kd["date_handwritten"] else "не распознана"
+            return _manual(f"дата утверждения Отчета по КД («{kd_name}») {how}, проверьте вручную: "
                            f"Отчет по КД утверждён не раньше {F.fmt_date(F.add_workdays(f['approval_date'], -5))} "
                            f"(Заключение {F.fmt_date(f['approval_date'])} — не позднее Отчета по КД + 5 р.д.)")
         limit = _plus_workdays(kd["date"], 5)
@@ -1254,3 +1258,80 @@ def run_checklist(ctype: str, items: list, checked: dict, all_texts: dict,
         })
         print(f"[formula {ctype}] {item.get('area', '')[:40]!r} → {v['status']}")
     return {"header": {}, "checklist": results}
+
+
+# ---------- План АУДИТА: точные проверки поверх вердикта GigaChat ----------
+# Модель на этих пунктах сбивается при верных данных: невалидный JSON (п. Договор), «галлюцинация
+# цитаты» при совпадающем составе ЭГ, «перерыв 45 мин — соответствует» с вердиктом NOK.
+# Ключи — номера правил main.ITEM_RULES (main._plan_rule_id).
+
+PLAN_RID_CONTRACT, PLAN_RID_TEAM, PLAN_RID_BREAK = 5, 8, 15
+
+
+def _plan_contract(ctx: Ctx, plan: dict) -> Optional[dict]:
+    nums, dates, files = _contract_refs(ctx)
+    if not files:
+        return _nok("Не загружен Договор — сверять не с чем.")
+    b_nums, b_dates = plan["basis"]
+    if not b_nums and not b_dates:
+        return None
+    extra = sorted(f"№ {n}" for n in b_nums - nums) + sorted(F.fmt_date(d) for d in b_dates - dates)
+    if extra:
+        return _manual("в Основании Плана есть реквизиты, которых нет в загруженных Договоре и доп. "
+                       f"соглашениях: {', '.join(extra)} — загрузите этот документ (доп. соглашение?)")
+    return _ok(f"реквизиты Основания Плана ({', '.join(sorted(b_nums))}) есть в загруженных документах: "
+               + ", ".join(files))
+
+
+def _plan_team(ctx: Ctx, plan: dict) -> Optional[dict]:
+    _, prikaz = ctx.source("prikaz", F.prikaz_fields)
+    if not prikaz:
+        return _nok("Не загружен Приказ о назначении ЭГ — сверять не с чем.")
+    members = {p for ps in plan["team"].values() for p in ps}
+    if not members or not prikaz["team"]:
+        return None
+    only_plan, only_prikaz = members - set(prikaz["team"]), set(prikaz["team"]) - members
+    if only_plan or only_prikaz:
+        diff = []
+        if only_plan:
+            diff.append("только в Плане — " + ", ".join(F.person_label(p) for p in sorted(only_plan)))
+        if only_prikaz:
+            diff.append("только в Приказе — " + ", ".join(F.person_label(p) for p in sorted(only_prikaz)))
+        return _nok("состав ЭГ в Плане (п.7) и Приказе расходится: " + "; ".join(diff))
+    roles = "; ".join(f"{F.ROLE_TITLES[r]}: {', '.join(F.person_label(p) for p in ps)}"
+                      for r, ps in plan["team"].items() if ps)
+    return _ok(f"состав ЭГ совпадает с Приказом ({roles})")
+
+
+_TIME_RANGE = re.compile(r"(\d{1,2})[:.](\d{2})[\s\-–—]+(\d{1,2})[:.](\d{2})")
+
+
+def _plan_breaks(text: str) -> Optional[dict]:
+    """Перерывы — строки расписания «12:00 - 12:45 | Перерыв»: не менее 30 минут."""
+    found = []
+    for line in (text or "").splitlines():
+        if "перерыв" not in line.lower():
+            continue
+        m = _TIME_RANGE.search(line)
+        if m:
+            a, b = int(m.group(1)) * 60 + int(m.group(2)), int(m.group(3)) * 60 + int(m.group(4))
+            found.append((f"{m.group(1)}:{m.group(2)}–{m.group(3)}:{m.group(4)}", b - a))
+    if not found:
+        return None
+    short = [f"{t} ({d} мин)" for t, d in found if d < 30]
+    if short:
+        return _nok("перерыв короче 30 минут: " + ", ".join(short))
+    durations = sorted({d for _, d in found})
+    return _ok(f"перерывов в расписании: {len(found)}, продолжительность — "
+               + ", ".join(f"{d} мин" for d in durations) + " (не менее 30 минут)")
+
+
+def plan_exact_check(rid: Optional[int], plan_text: str, all_texts: dict, doc_type_map: dict) -> Optional[dict]:
+    """Вердикт {status, reason} по разобранным полям или None — оставить вердикт модели."""
+    if rid not in (PLAN_RID_CONTRACT, PLAN_RID_TEAM, PLAN_RID_BREAK) or not plan_text:
+        return None
+    if rid == PLAN_RID_BREAK:
+        return _plan_breaks(plan_text)
+    ctx = Ctx({}, all_texts, doc_type_map)
+    plan = F.plan_fields(plan_text)
+    return _plan_contract(ctx, plan) if rid == PLAN_RID_CONTRACT else _plan_team(ctx, plan)

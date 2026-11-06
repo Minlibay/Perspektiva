@@ -4224,6 +4224,18 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
                         + (verdict.get("reason") or "")
                     )
 
+            # Точные проверки по разобранным полям (договор, состав ЭГ, перерыв) — поверх
+            # модели: на этих пунктах она сбивается при верных данных
+            exact = formula_checks.plan_exact_check(rid, plan_raw, all_texts, doc_type_map)
+            if exact:
+                verdict["ok"], verdict["nok"] = exact["status"] == "ok", exact["status"] == "nok"
+                verdict["reason"] = ("ПРОВЕРИТЬ ВРУЧНУЮ: " if exact["status"] == "manual" else "") + exact["reason"]
+            elif (verdict.get("reason") or "").startswith("[авто-NOK: модель дважды вернула невалидный JSON"):
+                # сбой модели — не замечание к документу: клетки ОК/NOK оставляем пустыми
+                verdict["ok"] = verdict["nok"] = False
+                verdict["reason"] = ("ПРОВЕРИТЬ ВРУЧНУЮ: GigaChat дважды вернул ответ в неверном формате — "
+                                     "автоматическая проверка пункта не удалась.")
+
             verdict["_files_checked"] = relevant
             # Дописываем в обоснование список файлов, в которых искалась информация
             if relevant:
@@ -4237,7 +4249,8 @@ def process_checklist_advanced(api_key: str, all_texts: dict,
             verdict["reason"] = (verdict.get("reason") or "").rstrip() + suffix
             checklist_results.append(verdict)
 
-            print(f"[item {idx+1}/{total}] {'OK' if verdict['ok'] else 'NOK'}: {item['area'][:50]}")
+            mark = "OK" if verdict["ok"] else "NOK" if verdict["nok"] else "РУЧНАЯ"
+            print(f"[item {idx+1}/{total}] {mark}: {item['area'][:50]}")
         except Exception as e:
             print(f"[item {idx+1}] Ошибка анализа: {e}")
             checklist_results.append({
@@ -4746,8 +4759,10 @@ def _validate_plan_output(file_path: Path) -> dict:
     for i, row in enumerate(checklist_rows):
         if row["both"]:
             issues.append(f"Строка {i+1}: ОБА маркера OK и NOK")
-        elif row["none"]:
-            issues.append(f"Строка {i+1}: НЕТ маркера")
+    # строка без отметки — пункт «ПРОВЕРИТЬ ВРУЧНУЮ» (клетки ОК/NOK оставлены пустыми намеренно)
+    manual = [str(i + 1) for i, row in enumerate(checklist_rows) if row["none"]]
+    if manual:
+        issues.append(f"На ручную проверку: пункт(ы) {', '.join(manual)}")
 
     # Структурные проблемы заполнения
     if len(checklist_rows) == 0:
@@ -4769,6 +4784,7 @@ def _validate_plan_output(file_path: Path) -> dict:
         "checklist_total": len(checklist_rows),
         "ok_count": ok_count,
         "nok_count": nok_count,
+        "manual_count": len(manual),
         "issues": issues
     }
 
@@ -4887,14 +4903,6 @@ def _extract_text(path: Path) -> Optional[str]:
 
 
 _EXTRACT_WORKERS = 3
-_READ_LOCKS: dict = {}  # session_id → кто сейчас распознаёт сканы сессии: фоновое чтение или проверка
-
-
-def _read_lock(session_id: str) -> threading.Lock:
-    with _JOBS_LOCK:
-        return _READ_LOCKS.setdefault(session_id, threading.Lock())
-
-
 def _pdf_needs_ocr(path: Path) -> bool:
     """Скан без текстового слоя: читается OCR — минуты, а не мгновенно."""
     try:
@@ -4917,8 +4925,8 @@ def _session_texts(session_id: str, sdir: Path, names: list, status: dict, ocr: 
     Кэш на диске (_texts.json): повторный разбор пакета и запуск проверки не читают файлы
     заново. Кэш сбрасывается для файла, у которого поменялись размер или время изменения.
     ocr=False — быстрый разбор: сканы без кэша не распознаются, а возвращаются вторым
-    значением (их распознаёт фоновое чтение или запуск проверки). Каждый прочитанный файл
-    сразу пишется в кэш — быстрый разбор видит распознанное по ходу фонового чтения."""
+    значением (их распознаёт запуск проверки). Каждый прочитанный файл сразу пишется в кэш —
+    разбор пакета из другой вкладки видит распознанное по ходу проверки."""
     with _session_lock(session_id):
         cache = _text_cache(sdir)
     texts, todo, pending = {}, [], []
@@ -4963,35 +4971,6 @@ def _session_texts(session_id: str, sdir: Path, names: list, status: dict, ocr: 
     return texts, pending
 
 
-def _start_background_reading(session_id: str, sdir: Path):
-    """Распознавание сканов сессии в фоне: оператор не ждёт OCR, чтобы отметить чек-листы и
-    запустить проверку. Прогресс — в /status (поле analysis, reading=True). Файлы,
-    загруженные во время чтения, дочитываются следующим проходом."""
-    progress = _analysis_status(session_id)
-    with _JOBS_LOCK:
-        if progress.get("reading"):
-            return
-        progress["reading"] = True
-
-    def work():
-        _status_local.status = progress  # «OCR файл: стр N/M» — в прогресс чтения
-        try:
-            while True:
-                names = [f["name"] for f in _session_package_files(session_id, sdir)]
-                with _read_lock(session_id):
-                    _session_texts(session_id, sdir, names, progress)
-                if {f["name"] for f in _session_package_files(session_id, sdir)} <= set(names):
-                    break
-        except Exception as e:
-            print(f"[read {session_id[:8]}] ошибка фонового чтения: {e}")
-        finally:
-            _status_local.status = None
-            progress.update({"reading": False, "stage": "idle", "current": 0, "total": 0,
-                             "message": "", "detail": ""})
-
-    threading.Thread(target=work, daemon=True).start()
-
-
 def _session_package_files(session_id: str, sdir: Path) -> list:
     """Файлы сессии с полем загрузки (meta.blocks). Файл без поля считается источником."""
     blocks = _load_session_meta(session_id).get("blocks") or {}
@@ -5004,24 +4983,12 @@ def _analyze_session(session_id: str, sdir: Path, overrides: dict, choices: dict
                      ocr: bool = True):
     """(разбор пакета, файлы с текстами).
 
-    ocr=False — быстрый разбор: нераспознанные сканы определяются по имени и помечаются
-    reading=True (список — в analysis["reading"]). ocr=True — все файлы с текстами (для
-    проверки): если сканы сейчас читает фоновое чтение, ждём его, показывая его ход в status."""
+    ocr=False — быстрый разбор (после загрузки файлов): нераспознанные сканы определяются по
+    имени и помечаются reading=True (список — в analysis["reading"]). ocr=True — все файлы с
+    текстами: сканы распознаются при запуске проверки, ход — в status."""
     files = _session_package_files(session_id, sdir)
     names = [f["name"] for f in files]
-    if ocr:
-        lock = _read_lock(session_id)
-        while not lock.acquire(timeout=1):
-            p = _analysis_status(session_id)
-            status.update({"stage": "extract", "message": "Распознавание сканов: " + (p.get("message") or "…"),
-                           "detail": p.get("detail") or "", "current": p.get("current", 0),
-                           "total": p.get("total", 0)})
-        try:
-            texts, pending = _session_texts(session_id, sdir, names, status)
-        finally:
-            lock.release()
-    else:
-        texts, pending = _session_texts(session_id, sdir, names, status, ocr=False)
+    texts, pending = _session_texts(session_id, sdir, names, status, ocr=ocr)
     for f in files:
         f["text"] = texts.get(f["name"])
     analysis = package.analyze_package(files, overrides, choices)
@@ -5147,6 +5114,14 @@ def _run_package_job(session_id: str, sdir: Path, api_key: str, selection: list,
         by_file = {c["file"]: c for c in analysis["checklists"]}
         todo = [by_file[n] for n in selection if n in by_file and by_file[n]["ready"]]
         todo.sort(key=lambda c: {"plan": 0, "svod": 1}.get(c["type"], 2))
+        # чек-лист отметили до распознавания сканов, а документа для него так и не нашлось
+        for n in selection:
+            ck = by_file.get(n)
+            if ck and not ck["ready"]:
+                status["outputs"] = status["outputs"] + [{
+                    "type": ck["type"], "title": ck["title"], "checklist_file": ck["file"],
+                    "checked_files": [], "warnings": ck["warnings"],
+                    "error": f"Не проверен: {ck['problem'] or 'нет проверяемого документа'}"}]
         texts = {f["name"]: f["text"] for f in files}
         docs = [f for f in analysis["files"] if f["kind"] == "document"]
         all_texts = {d["name"]: texts[d["name"]] for d in docs if texts.get(d["name"]) is not None}
@@ -5246,15 +5221,13 @@ async def analyze_session(session_id: str, req: Optional[AnalyzeRequest] = None)
     запустить и с какими документами, предупреждения.
 
     Быстрый: сканы, которые ещё не распознаны, определяются по имени (reading=True у файла,
-    список — в поле reading) и распознаются в фоне. Ход чтения — в /api/sessions/{id}/status
-    (поле analysis); когда reading там станет false, повторный разбор даст полные данные."""
+    список — в поле reading). Распознаются они только при запуске проверки (/run) — после неё
+    повторный разбор даёт полные данные."""
     import asyncio
     sdir = _existing_session(session_id)
     req = req or AnalyzeRequest()
     analysis, _ = await asyncio.to_thread(
         _analyze_session, session_id, sdir, req.overrides, req.choices, {}, False)
-    if analysis["reading"]:
-        _start_background_reading(session_id, sdir)
     return analysis
 
 
