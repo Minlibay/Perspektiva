@@ -105,10 +105,10 @@ def _load_session_meta(session_id: str) -> dict:
 
 
 def _list_session_files(sdir: Path) -> list[dict]:
-    """Перечень файлов сессии (без _meta.json)."""
+    """Перечень загруженных файлов сессии: без служебных (_meta.json, _texts.json, кэш OCR)."""
     files = []
     for f in sorted(sdir.iterdir()):
-        if f.name.startswith("_") or not f.is_file():
+        if f.name.startswith("_") or f.name.endswith(".ocr.txt") or not f.is_file():
             continue
         try:
             st = f.stat()
@@ -414,7 +414,8 @@ def extract_text_from_docx(file_path: str) -> str:
     cb_xml = _extract_checkboxes_from_docx_xml(file_path)
     if cb_xml:
         extras.append(cb_xml)
-    cb_sym = _scan_text_for_checkbox_symbols(body)
+    # секцию «=== ОТМЕТКИ …» повторно не сканируем — иначе отметки задвоятся
+    cb_sym = _scan_text_for_checkbox_symbols(body.split("=== ОТМЕТКИ")[0])
     if cb_sym:
         extras.append(cb_sym)
     if extras:
@@ -426,17 +427,63 @@ _OCR_DPI = int(os.environ.get("OCR_DPI", "200"))
 _OCR_LANG = os.environ.get("OCR_LANG", "rus+eng")
 
 
-def _ocr_pdf_pages(file_path: str, dpi: int = None) -> str:
-    """OCR всех страниц PDF через PyMuPDF (рендер) + Tesseract (распознавание)."""
-    import fitz
+def _ocr_page(img, dpi: int) -> tuple:
+    """(текст страницы, отметки [(отмечено, подпись)]) для картинки страницы скана.
+
+    1) Поворот: скан бывает положен боком (Отчет по КД) — ориентацию определяет Tesseract (OSD).
+    2) Выравнивание наклона: на перекошенном скане линии таблиц рвутся на ступеньки.
+    3) Слова с координатами, таблицы — по ячейкам «ячейка | ячейка» (scan_tables).
+    4) Отметки ☒ / ☐ — по картинке (scan_marks): OCR пустой и отмеченный квадрат не различает."""
     import pytesseract
+    import scan_marks
+    import scan_tables
+
+    img = img.convert("L")
+
+    def osd_angle(im) -> int:
+        try:
+            return scan_tables.upright_angle(pytesseract.image_to_osd(im))
+        except Exception:  # мало текста для определения ориентации
+            return 0
+
+    angle = osd_angle(img)
+    if angle:
+        turned = img.rotate(-angle, expand=True, fillcolor=255)  # «Rotate: 90» — по часовой
+        if osd_angle(turned):                                     # не встала — значит, в другую сторону
+            turned = img.rotate(angle, expand=True, fillcolor=255)
+        img = turned
+    img = scan_tables.deskew(img)
+
+    cells = scan_tables.find_cells(img, dpi)
+    clean = scan_tables.erase_lines(img, dpi)   # линии таблиц Tesseract читает как «|»
+    data = pytesseract.image_to_data(clean, lang=_OCR_LANG, output_type=pytesseract.Output.DICT)
+
+    def fill_empty(box):
+        # пустая для Tesseract ячейка с чернилами — обычно одиночный номер строки «1», «2»
+        if not scan_tables.has_ink(clean, box):
+            return ""
+        crop = clean.crop(box)
+        return " ".join(pytesseract.image_to_string(crop, lang=_OCR_LANG, config="--psm 6").split())
+
+    text = scan_tables.page_text(scan_tables.words_from_data(data), cells, fill_empty)
+    boxes = scan_marks.find_boxes(img, dpi)
+    marks = scan_marks.label_marks(
+        clean, boxes, lambda crop: pytesseract.image_to_string(crop, lang=_OCR_LANG, config="--psm 6"))
+    return text, marks
+
+
+def _ocr_pdf_pages(file_path: str, dpi: int = None) -> str:
+    """OCR всех страниц PDF: рендер PyMuPDF, распознавание Tesseract (_ocr_page). Отметки
+    со всех страниц — одной секцией «=== ОТМЕТКИ … ===» в конце (её читает fields.checkbox_marks)."""
+    import fitz
     from PIL import Image
     import io
+    import scan_marks
 
     if dpi is None:
         dpi = _OCR_DPI
 
-    pages_text = []
+    pages_text, marks = [], []
     try:
         doc = fitz.open(file_path)
     except Exception as e:
@@ -451,21 +498,29 @@ def _ocr_pdf_pages(file_path: str, dpi: int = None) -> str:
                 processing_status["detail"] = f"OCR {fname}: стр {page_idx + 1}/{page_count}"
                 pix = page.get_pixmap(dpi=dpi, alpha=False)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
-                page_text = pytesseract.image_to_string(img, lang=_OCR_LANG)
+                page_text, page_marks = _ocr_page(img, dpi)
+                marks += page_marks
                 if page_text.strip():
                     pages_text.append(f"--- Страница {page_idx + 1} (OCR) ---\n{page_text}")
-                print(f"[ocr] {fname} стр.{page_idx+1}/{page_count}: {len(page_text)} симв.")
+                print(f"[ocr] {fname} стр.{page_idx+1}/{page_count}: {len(page_text)} симв., отметок {len(page_marks)}")
             except Exception as e:
                 print(f"[ocr] Ошибка стр.{page_idx+1} {file_path}: {e}")
     finally:
         doc.close()
 
-    return "\n\n".join(pages_text)
+    section = scan_marks.marks_section(marks)
+    return "\n\n".join(pages_text + ([section] if section else []))
+
+
+# Версия распознавания сканов: при её смене кэши OCR (файловый и _texts.json) считаются
+# устаревшими, и сканы распознаются заново.
+OCR_VERSION = 2
 
 
 def _ocr_pdf_with_cache(file_path: str) -> str:
-    """OCR с кэшированием в <file>.ocr.txt — повторно не запускаем."""
-    cache = Path(file_path).with_suffix(Path(file_path).suffix + ".ocr.txt")
+    """OCR с кэшированием в _<file>.ocr<версия>.txt — повторно не запускаем. Имя с «_» —
+    служебный файл: в перечень загруженных документов сессии он не попадает."""
+    cache = Path(file_path).with_name(f"_{Path(file_path).name}.ocr{OCR_VERSION}.txt")
     if cache.exists():
         try:
             return cache.read_text(encoding="utf-8")
@@ -531,7 +586,8 @@ def extract_text_from_pdf(file_path: str) -> str:
     cb_fields = _extract_checkboxes_from_pdf_fields(file_path)
     if cb_fields:
         extras.append(cb_fields)
-    cb_sym = _scan_text_for_checkbox_symbols(body)
+    # секцию «=== ОТМЕТКИ …» повторно не сканируем — иначе отметки задвоятся
+    cb_sym = _scan_text_for_checkbox_symbols(body.split("=== ОТМЕТКИ")[0])
     if cb_sym:
         extras.append(cb_sym)
     if extras:
@@ -4848,7 +4904,7 @@ def _session_texts(session_id: str, sdir: Path, names: list, status: dict) -> di
                 st = (sdir / name).stat()
             except OSError:
                 continue
-            stamp = f"{st.st_size}:{int(st.st_mtime)}"
+            stamp = f"ocr{OCR_VERSION}:{st.st_size}:{int(st.st_mtime)}"
             hit = cache.get(name)
             if hit and hit.get("stamp") == stamp:
                 texts[name] = hit.get("text")

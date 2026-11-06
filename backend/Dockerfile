@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
         tesseract-ocr-rus \
         tesseract-ocr-eng \
+        tesseract-ocr-osd \
     && rm -rf /var/lib/apt/lists/*
 
 # Индекс пакетов можно подменить на зеркало, если pypi.org недоступен/медленный:

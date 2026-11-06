@@ -81,7 +81,8 @@ class Ctx:
         if dtypes not in self._cache:
             found = (None, None)
             for dtype in dtypes:
-                parsed = [(n, parse(self.all_texts[n])) for n in doc_types.files_of_type(self.doc_type_map, dtype)]
+                parsed = [(n, parse(self.all_texts[n])) for n in doc_types.files_of_type(self.doc_type_map, dtype)
+                          if self.all_texts.get(n)]
                 if parsed:
                     found = max(parsed, key=lambda x: pick(x[1])) if pick else parsed[0]
                     break
@@ -840,9 +841,11 @@ def _zakl_decisions(ctx: Ctx) -> dict:
         return _nok(NO_AKT)
 
     def check(f):
-        types, note = f["types"], ""
+        # Рекомендация зависит от фактического вида аудита — он в Акте. Отметка п.1 самого
+        # Заключения может быть ошибочной (её сверяет отдельный пункт), поэтому она — запасной вариант.
+        types, note = akt["types"], ""
         if not types:
-            types, note = akt["types"], " (вид аудита взят из Акта: в п.1 Заключения не отмечен)"
+            types, note = f["types"], " (вид аудита взят из п.1 Заключения: в Акте не распознан)"
         main = types - {F.EXTENSION}
         if not main:
             return _manual("вид аудита не определён ни в Заключении, ни в Акте")

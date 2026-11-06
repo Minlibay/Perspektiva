@@ -62,7 +62,8 @@ def find_period(text: str) -> Optional[tuple]:
     """Период аудита (начало, конец): «27-30.07.2026», «27.07.2026 - 30.07.2026»,
     «с 27.07.2026 по 30.07.2026». Одна дата — период из одного дня."""
     t = text or ""
-    m = re.search(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\.(\d{1,2})\.(\d{2,4})", t)
+    # «15-19. 06.2026» — в клетке формы дата перенесена на две строки (в скане — пробел)
+    m = re.search(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\.\s*(\d{1,2})\.(\d{2,4})", t)
     if m:
         y, mo = int(m.group(4)), int(m.group(3))
         a, b = _mk_date(y, mo, int(m.group(1))), _mk_date(y, mo, int(m.group(2)))
@@ -118,6 +119,18 @@ OPF_EXPANSIONS = [
     ("индивидуальный предприниматель", "ип"),
 ]
 
+# Полная ОПФ в любом падеже: «Акционерное общество», «Акционерном обществе», «Обществу с
+# ограниченной ответственностью». Порядок: составные формы раньше «акционерного общества».
+_OPF_FULL_RES = [
+    (r"непубличн\w*\s+акционерн\w*\s+обществ\w*", "нао"),
+    (r"публичн\w*\s+акционерн\w*\s+обществ\w*", "пао"),
+    (r"закрыт\w*\s+акционерн\w*\s+обществ\w*", "зао"),
+    (r"открыт\w*\s+акционерн\w*\s+обществ\w*", "оао"),
+    (r"акционерн\w*\s+обществ\w*", "ао"),
+    (r"обществ\w*\s+с\s+ограниченной\s+ответственностью", "ооо"),
+    (r"индивидуальн\w*\s+предпринимател\w*", "ип"),
+]
+
 
 def normalize_org_name(name: str) -> tuple[str, str]:
     """Нормализует наименование юр.лица.
@@ -136,10 +149,11 @@ def normalize_org_name(name: str) -> tuple[str, str]:
 
     # развёрнутая ОПФ → аббревиатура (сравниваем полные формы до коротких, чтобы «акционерное общество» не съело «публичное акционерное общество»)
     opf = ""
-    for full, short in OPF_EXPANSIONS:
-        if s.startswith(full + ' ') or s == full:
+    for pattern, short in _OPF_FULL_RES:
+        m = re.match(pattern + r"(?:\s|$)", s)
+        if m:
             opf = short
-            s = s[len(full):].strip()
+            s = s[m.end():].strip()
             break
     if not opf:
         # Если ОПФ-аббревиатура — первое короткое «слово» (2–6 букв) перед названием.
@@ -156,7 +170,7 @@ def normalize_org_name(name: str) -> tuple[str, str]:
 
 
 _OPF_ALT = "|".join(
-    [re.escape(full) for full, _ in OPF_EXPANSIONS]
+    [pattern for pattern, _ in _OPF_FULL_RES]
     + [r"ООО", r"ПАО", r"НАО", r"ЗАО", r"ОАО", r"АО", r"ИП"]
 )
 # ОПФ и открывающая кавычка; само название разбирает _quoted_name
@@ -197,7 +211,9 @@ def find_org(text: str, last: bool = False) -> Optional[dict]:
     сертификации: {"name": как написано, "key": (opf, core), "full_form": ОПФ полностью}.
     last=True — для блока над подписью «наименование проверяемой организации»: выше него
     может стоять «УТВЕРЖДАЮ … ООО «…»», а нужное поле — ближайшее к подписи."""
-    t = text or ""
+    # OCR пишет аббревиатуры латиницей: «AO «Завод…», «OOO»; длина текста не меняется
+    t = re.sub(r"(?<![A-Za-zА-Яа-яЁё])[A-ZА-ЯЁ]{2,3}(?=\s*[«\"])",
+               lambda m: m.group(0).translate(_LAT2CYR), text or "")
     orgs = []
     for m in _ORG_RE.finditer(t):
         inner = _quoted_name(t, m.end())
@@ -215,12 +231,23 @@ def find_org(text: str, last: bool = False) -> Optional[dict]:
 
 # ---------- ФИО ----------
 
+# Латинские буквы, неотличимые от кириллических: OCR ставит их в инициалы и аббревиатуры
+_LAT2CYR = str.maketrans("ABCEHKMOPTXaceopx", "АВСЕНКМОРТХасеорх")
+
 _SURNAME = r"([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)(?![\dА-Яа-яЁё])"
 _PERSON_RES = [
     # Фамилия И.О.
     re.compile(r"(?<![А-Яа-яЁё])" + _SURNAME + r"\s+([А-ЯЁ])\.\s*([А-ЯЁ])\.?"),
     # И.О. Фамилия
     re.compile(r"(?<![А-Яа-яЁё])([А-ЯЁ])\.\s*([А-ЯЁ])\.\s*" + _SURNAME),
+]
+_WORD = r"[А-ЯЁ][а-яё]+"
+_PATRONYMIC = r"[А-ЯЁ][а-яё]+(?:вич|вна|ична|ьич|инична)"
+# Фамилия Имя Отчество / Имя Отчество Фамилия (так пишут представителя организации)
+_FULL_NAME_RES = [
+    (re.compile(r"(?<![А-Яа-яЁё])" + _SURNAME + r"\s+(" + _WORD + r")\s+(" + _PATRONYMIC + r")(?![а-яё])"),
+     (1, 2, 3)),
+    (re.compile(r"(?<![А-Яа-яЁё])(" + _WORD + r")\s+(" + _PATRONYMIC + r")\s+" + _SURNAME), (3, 1, 2)),
 ]
 
 
@@ -230,7 +257,8 @@ def find_persons(text: str) -> list:
     ищется внутри уже найденной «Фамилия И.О.»: в «Сукорская О.А. Гревцов К.В.»
     нет человека «О.А. Гревцов»."""
     found = []
-    t = text or ""
+    # OCR путает похожие буквы: инициалы «Жабкин A.A.» латиницей
+    t = re.sub(r"(?<![A-Za-zА-Яа-яЁё])([ABCEHKMOPTX])(?=\.)", lambda m: m.group(1).translate(_LAT2CYR), text or "")
     taken = []
     for m in _PERSON_RES[0].finditer(t):
         found.append((m.start(), f"{m.group(1).lower()} {m.group(2).lower()}{m.group(3).lower()}"))
@@ -239,6 +267,13 @@ def find_persons(text: str) -> list:
         if any(a <= m.start() < b for a, b in taken):
             continue
         found.append((m.start(), f"{m.group(3).lower()} {m.group(1).lower()}{m.group(2).lower()}"))
+        taken.append(m.span())
+    for rx, (si, ni, pi) in _FULL_NAME_RES:
+        for m in rx.finditer(t):
+            if any(a <= m.start() < b or a < m.end() <= b for a, b in taken):
+                continue
+            found.append((m.start(), f"{m.group(si).lower()} {m.group(ni)[0].lower()}{m.group(pi)[0].lower()}"))
+            taken.append(m.span())
     found.sort()
     keys = []
     for _, k in found:
@@ -257,11 +292,30 @@ def person_label(key: str) -> str:
 
 # ---------- Отметки ----------
 
+_INLINE_MARK_RE = re.compile(r"([☐☑☒])\s*([^☐☑☒\n]*)")
+
+
+def _inline_marks(text: str) -> list:
+    """Отметки символами прямо в тексте: «☒ Второй этап … ☐ Внеплановый …» — в строке их
+    может быть несколько. Служебные секции экстрактора («=== … ===», «☒ ОТМЕЧЕНО | …»)
+    не читаются: в них те же отметки ещё раз."""
+    marks = []
+    for line in (text or "").splitlines():
+        if line.startswith("===") or re.search(r"ОТМЕЧЕНО\s*\|", line):
+            continue
+        for m in _INLINE_MARK_RE.finditer(line):
+            label = re.sub(r"\s+", " ", m.group(2)).strip()
+            if label:
+                marks.append((m.group(1) != "☐", label))
+    return marks
+
+
 def checkbox_marks(text: str) -> list:
-    """Отметки из секции экстрактора «=== ОТМЕТКИ … ===»: [(отмечено, подпись)]."""
+    """Отметки [(отмечено, подпись)]: из секции «=== ОТМЕТКИ … ===» (её пишет экстрактор
+    .docx и распознавание галочек на сканах), а если её нет — символы ☒/☐ в тексте."""
     i = (text or "").find("=== ОТМЕТКИ")
     if i < 0:
-        return []
+        return _inline_marks(text)
     marks = []
     for line in text[i:].splitlines()[1:]:
         if line.startswith("==="):
@@ -291,6 +345,33 @@ def _segment(text: str, start_pat: str, end_pat: Optional[str] = None, limit: in
     return seg
 
 
+_SEP = r"[\W_]{1,6}"  # между словами фразы: пробелы, переносы, «/», «|», «)» от OCR
+
+
+def _find_phrase(text: str, phrase: str) -> int:
+    """Позиция фразы без учёта регистра и переносов строк между словами (в скане
+    «Руководитель экспертной\nгруппы», с мусором OCR «экспертной /\nгруппы») или -1."""
+    m = re.search(_SEP.join(map(re.escape, phrase.split())), text or "", re.IGNORECASE)
+    return m.start() if m else -1
+
+
+def leader_signature(body: str) -> tuple:
+    """(ФИО, дата) из подписи руководителя ЭГ в конце документа: «Руководитель экспертной
+    группы | | О.А. Сукорская | | 30.07.2026» — в .docx одной строкой, в скане и PDF на
+    двух-трёх строках. Берётся последняя подпись с датой (в п.8 Акта даты нет)."""
+    result = (None, None)
+    rx = "Руководитель" + _SEP + "экспертной" + _SEP + "группы"
+    for m in re.finditer(rx, body or "", re.IGNORECASE):
+        window = body[m.end(): m.end() + 160]
+        stop = re.search(r"Представитель|\n\s*\n\s*\n|" + rx, window, re.IGNORECASE)
+        window = window[: stop.start()] if stop else window
+        d = first_date(window)
+        if d:
+            persons = find_persons(window)
+            result = (persons[0] if persons else None, d)
+    return result
+
+
 # ---------- Состав экспертной группы ----------
 
 _ROLE_ORDER = [  # порядок важен: «Руководитель экспертной группы» содержит «эксперт»
@@ -313,7 +394,9 @@ def parse_team(segment: str) -> dict:
     {роль: [ключи ФИО]}."""
     team = {}
     for line in (segment or "").splitlines():
-        head, _, tail = line.partition("|")
+        head, sep, tail = line.partition("|")
+        if not sep:  # «8.1 Руководитель экспертной группы Сукорская О.А.»
+            tail = line
         low = head.lower().replace("ё", "е")
         role = next((r for r, k in _ROLE_ORDER if k in low), None)
         if role is None:
@@ -458,8 +541,14 @@ def akt_fields(text: str) -> dict:
     t = text or ""
     body = t.split("=== ОТМЕТКИ")[0]
     f = {}
-    org_block = _segment(t, r"\(вид системы менеджмента\)", r"наименование проверяемой организации", 400)
-    f["org"] = find_org(org_block) or find_org(t)
+    # Наименование — между «(вид системы менеджмента)» и подписью поля «наименование проверяемой
+    # организации полностью»; под полным может стоять сокращённое в скобках — берём первое.
+    # OCR портит «(вид системы…)» («(BH системы менеджмента)»), поэтому опора — «менеджмента».
+    i = _find_phrase(t, "наименование проверяемой организации")
+    org_block = t[max(0, i - 300): i] if i >= 0 else ""
+    j = org_block.lower().rfind("менеджмента")
+    f["org"] = ((find_org(org_block[j:]) if j >= 0 else find_org(org_block, last=True))
+                or find_org(t))
     f["types"] = marked_audit_types(t)
     f["area"] = _segment(body, r"применительно к", r"область применения", 1500)
     f["basis"] = basis_refs(_segment(body, r"Основание", r"\n\s*3\s+[А-Я]", 400))
@@ -475,14 +564,7 @@ def akt_fields(text: str) -> dict:
     f["representative"] = find_persons(rep)[0] if find_persons(rep) else None
 
     # Подписи в конце: «Руководитель экспертной группы | | О.А. Сукорская | | 30.07.2026»
-    f["date"], f["leader_sign"] = None, None
-    for line in body.splitlines():
-        if "руководитель экспертной группы" in line.lower():
-            d = first_date(line)
-            if d:
-                f["date"] = d
-                persons = find_persons(line)
-                f["leader_sign"] = persons[0] if persons else None
+    f["leader_sign"], f["date"] = leader_signature(body)
 
     m = re.search(r"в ходе настоящего аудита выявлено\s+(\d+)", t, re.IGNORECASE)
     f["nc_23_2"] = int(m.group(1)) if m else None
@@ -490,7 +572,8 @@ def akt_fields(text: str) -> dict:
 
     def _nc(kind: str) -> Optional[int]:
         # «24 Результаты аудита»: значение стоит в ячейке ПЕРЕД названием строки
-        mm = re.search(r"(?m)^\s*(\d*)\s*\|\s*Количество\s+" + kind + r"\s+несоответстви\w*(?!\s*,)", t,
+        # в скане разделителя «|» нет: «7 Количество малозначительных несоответствия»
+        mm = re.search(r"(?m)^\s*(\d*)\s*\|?\s*Количество\s+" + kind + r"\s+несоответстви\w*(?!\s*,)", t,
                        re.IGNORECASE)
         if not mm:
             return None
@@ -515,10 +598,10 @@ def akt_fields(text: str) -> dict:
     # Список рассылки и подписи — в хвосте документа после «Список рассылки»
     i = body.lower().rfind("список рассылки")
     tail = body[i:] if i >= 0 else ""
-    j = tail.lower().find("руководитель экспертной группы")
+    j = _find_phrase(tail, "руководитель экспертной группы")
     f["distribution_org"] = find_org(tail[:j] if j >= 0 else tail)
     sign_block = tail[j:] if j >= 0 else ""
-    k = sign_block.lower().find("представитель проверяемой организации")
+    k = _find_phrase(sign_block, "представитель проверяемой организации")
     f["signers"] = find_persons(sign_block[:k] if k >= 0 else sign_block) if j >= 0 else []
     return f
 
@@ -575,20 +658,36 @@ def pn_fields(text: str) -> dict:
 
 # ---------- ПКД и Отчет по КД (утверждаемые организацией документы) ----------
 
+_DIGIT_LIKE_MAP = {"т": "7", "Т": "7", "з": "3", "З": "3", "б": "6", "l": "1", "I": "1", "S": "5"}
+_DIGIT_LIKE = "".join(_DIGIT_LIKE_MAP)
+
+
 def count_table_rows(text: str) -> Optional[int]:
     """Строки таблицы несоответствий: после заголовка «№ п/п» — строки «N | …» с номерами
     1, 2, 3… подряд. Строка нумерации колонок «1 | 2 | 3 | …» под заголовком не считается.
     None — заголовка нет (например, плохой OCR)."""
     t = text or ""
-    i = t.find("№ п/п")
-    if i < 0:
+    m = re.search(r"(?m)№\s*п/п|^\s*(?:№\s*)?[пn]\s*/\s*[пnтt]\b", t)  # OCR: «n/t», «п/т»
+    if not m:
         return None
+    i = m.start()
     n = 0
-    for m in re.finditer(r"(?m)^\s*(\d{1,3})\s*\|(.*)$", t[i:]):
+    for m in re.finditer(r"(?m)^\s*(\d{1,3}|[" + _DIGIT_LIKE + r"])\s*\|(.*)$", t[i:]):
         if re.fullmatch(r"(?:\s*\d{1,2}\s*\|?)+\s*", m.group(2)):
             continue  # «1 | 2 | 3 | 4 | 5» — номера колонок
-        if int(m.group(1)) == n + 1:
+        num = m.group(1)
+        if not num.isdigit():
+            # одиночная цифра в клетке, прочитанная OCR как буква: «7» → «т»
+            num = _DIGIT_LIKE_MAP[num]
+        if int(num) == n + 1:
             n += 1
+    if n == 0:
+        # PDF с текстовым слоем: ячейки без «|», строка таблицы начинается с номера —
+        # «1 Не представлены…», «2 На Перечне…». «1. График…» (номер с точкой) — список
+        # внутри ячейки, а не строка таблицы.
+        for m in re.finditer(r"(?m)^\s*(\d{1,3})\s+(?=[А-ЯЁA-Z«\"])", t[i:]):
+            if int(m.group(1)) == n + 1:
+                n += 1
     return n
 
 
@@ -628,7 +727,9 @@ def loo_fields(text: str) -> dict:
 
     signs = list(re.finditer(r"(?m)^\s*Дата\b(?!\s+аудита)", body))
     f["date"] = first_date(body[signs[-1].end(): signs[-1].end() + 80]) if signs else None
-    signer = find_persons(_segment(body, r"Ф\.\s*И\.\s*О", None, 200))
+    # подписавший — после «Ф.И.О», а если OCR не прочитал подпись поля («0.4.0») — после «Подпись»
+    signer = (find_persons(_segment(body, r"Ф\.\s*И\.\s*О", None, 200))
+              or find_persons(_segment(body, r"Подпись", None, 200)))
     f["signer"] = signer[0] if signer else None
 
     marks = checkbox_marks(t)
@@ -713,11 +814,7 @@ def zakl_fields(text: str) -> dict:
     org_block = body[max(0, i - 300): i] if i >= 0 else body
     approvers = find_persons(approve)
 
-    leader, sign_date = None, None
-    for line in body.splitlines():
-        if "руководитель экспертной группы" in line.lower() and first_date(line):
-            persons = find_persons(line)
-            leader, sign_date = (persons[0] if persons else None), first_date(line)
+    leader, sign_date = leader_signature(body)
 
     dist = _segment(body, r"Список рассылки", r"Руководитель экспертной группы", 400)
     return {

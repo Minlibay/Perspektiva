@@ -107,7 +107,7 @@ def test_zakl_problems(checklist_path):
     assert r[7][0] == "nok"                                    # «Несоответствия устранены»
     status, reason = r[9]                                      # п.4 по Акту: ИК + расширение
     assert status == "nok" and "«Подтвердить действие сертификата» не отмечено" in reason
-    assert "вид аудита взят из Акта" in reason
+    assert "вид аудита взят" not in reason                     # вид аудита — из Акта, без оговорок
 
 
 def test_zakl_needs_otchet_kd(checklist_path):
